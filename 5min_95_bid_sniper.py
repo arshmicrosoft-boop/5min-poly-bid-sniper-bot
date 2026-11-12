@@ -116,7 +116,7 @@ SESSION_REPRICES = 0
 SESSION_CUTOFF_CANCELS = 0
 SESSION_TIMEOUTS = 0
 SESSION_PAPER_WINS = 0
-SESSION_PAPER_LOSES = 0
+SESSION_PAPER_LOSSES = 0
 SESSION_PAPER_PNL = 0.0
 SESSION_PAPER_MAX_LOSS = 0.0
 SESSION_PAPER_MAX_PROFIT = 0.0
@@ -816,7 +816,7 @@ def _resolve_paper_window(market_states, market_books):
                 SESSION_PAPER_MAX_PROFIT = pnl
             SESSION_CURRENT_STREAK = SESSION_CURRENT_STREAK + 1 if SESSION_CURRENT_STREAK >= 0 else 1
         else:
-            SESSION_PAPER_LOSES += 1
+            SESSION_PAPER_LOSSES += 1
             fees_slip = (entry * DRY_RUN_FEE_RATE + DRY_RUN_SLIPPAGE) * shares
             pnl = -(cost + fees_slip)
             if abs(pnl) > SESSION_PAPER_MAX_LOSS:

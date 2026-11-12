@@ -445,6 +445,8 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     rec = sub.add_parser("record")
     rec.add_argument("--output", default="data/market_data.jsonl")
+    rec.add_argument("--assets", default="", help="comma list, e.g. BTC,ETH (default all)")
+    rec.add_argument("--duration", type=float, default=0.0, help="seconds (0 = forever)")
     rep = sub.add_parser("report")
     rep.add_argument("--input", default="data/market_data.jsonl")
     rep.add_argument("--latency-ms", type=int, default=DEFAULT_LATENCY_MS)
@@ -453,7 +455,10 @@ def main():
     rep.add_argument("--trades-out", default="results/trades.csv")
     args = parser.parse_args()
     if args.command == "record":
-        print("Recording not implemented in this trimmed module. Use poly5m/ws_collector or original recorder.")
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from poly5m.ws_collector import record
+
+        record(args.output, args.assets, args.duration)
     else:
         print("Report: run backtest_rigorous.py instead.")
 
