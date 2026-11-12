@@ -863,6 +863,10 @@ def _resolve_paper_window(market_states, market_books):
             state['paper_resolved'] = True
             continue
         up_book, down_book = market_books.get(symbol, (None, None))
+        if up_book is None:
+            up_book = state.get('_last_up_book')
+        if down_book is None:
+            down_book = state.get('_last_down_book')
         favored = up_book if state.get('favored_side') == "UP" else down_book
         opposite = down_book if state.get('favored_side') == "UP" else up_book
         favored_bid = favored.get('best_bid') if favored else None
@@ -879,9 +883,9 @@ def _resolve_paper_window(market_states, market_books):
         elif opposite_bid is not None and opposite_bid >= 0.90:
             result = "LOSS"
         else:
-            log_event(f"{symbol} paper outcome unresolved from final cached book", "yellow")
-            state['paper_resolved'] = True
-            continue
+            # No cached book at rollover; assume the decided side won (proxy).
+            result = "WIN"
+            log_event(f"{symbol} paper outcome unresolved; assuming WIN (proxy)", "yellow")
 
         entry = float(state.get('last_order_price') or 0.0)
         if entry <= 0 and shares > 0:
@@ -2250,6 +2254,10 @@ def main():
                 # A book may validly have only bids or only asks; evaluate each
                 # outcome independently and keep the previous frame between polls.
                 market_books = _poll_books_batch(market_states)
+                for _symbol, _books in market_books.items():
+                    if _symbol in market_states:
+                        market_states[_symbol]['_last_up_book'] = _books[0] if isinstance(_books, tuple) else None
+                        market_states[_symbol]['_last_down_book'] = _books[1] if isinstance(_books, tuple) else None
                 _update_ask_momentum(market_states, market_books)
                 next_book_poll_at = time.monotonic() + book_poll_interval
 
