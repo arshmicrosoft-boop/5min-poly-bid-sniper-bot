@@ -101,20 +101,30 @@ API_KEY_AUG14=
 API_SECRET_AUG14=
 PASSPHRASE_AUG14=
 DRY_RUN=true
-MAX_TOTAL_EXPOSURE_USD=10.0
+TARGET_NOTIONAL_USD=1.0
+MAX_ORDER_NOTIONAL_USD=5.0
+MAX_TOTAL_EXPOSURE_USD=5.0
+MAX_SESSION_LOSS_USD=8.0
+MAX_POSITION_LOSS_USD=4.50
+SOFT_ENTRY_CUTOFF_SEC=15
+STOP_THRESHOLD_SEC=10
 ```
 
 Strategy constants in `5min_95_bid_sniper.py`:
 
 | Setting | Default | Meaning |
 |---|---:|---|
-| `BET_SIZE_USD` | `$1.00` | Per-market target (bumped to 5-share floor ≈ $4.75) |
+| `TARGET_NOTIONAL_USD` | `$1.00` | Desired notional before minimum-share rounding; actual order can be larger |
+| `MAX_ORDER_NOTIONAL_USD` | `$5.00` | Hard maximum notional for one order; excess is rejected |
 | `ENTRY_THRESHOLD` | `0.95` | Ask must be ≥ this to be "decided" |
 | `MAX_BUY_PRICE` | `0.95` | Hard cap on bid price |
 | `ENTRY_WINDOW_SEC` | `60` | Only act in final 60s |
-| `STOP_THRESHOLD_SEC` | `5` | Cancel / no new orders below this |
+| `SOFT_ENTRY_CUTOFF_SEC` | `15` | Stop opening new orders below this; existing orders are still managed |
+| `STOP_THRESHOLD_SEC` | `10` | Cancel resting orders at/below this threshold |
 | `ORDER_UPDATE_INTERVAL` | `3` | Re-check cadence (seconds) |
-| `MAX_TOTAL_EXPOSURE_USD` | `10.0` | Global resting notional cap |
+| `MAX_TOTAL_EXPOSURE_USD` | `5.0` | Global resting plus filled exposure cap |
+| `MAX_SESSION_LOSS_USD` | `8.0` | Dry-run loss limit; stops the session and cancels resting orders |
+| `MAX_POSITION_LOSS_USD` | `4.50` | Marked-loss alert/halt for new entries; does not exit held positions |
 
 ---
 

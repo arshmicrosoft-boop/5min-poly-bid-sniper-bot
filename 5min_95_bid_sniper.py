@@ -18,7 +18,8 @@ STRATEGY (the whole thing in 5 lines):
     being decided (ask drops < 0.95). One fill per market, then hold to expiry.
   - 95c -> 100c = 5.26% per win. We just want 5% every 5 minutes.
 NOTE ON SIZE: Polymarket enforces a 5-share minimum per order. At 0.95 that is
-  ~$4.75, so BET_SIZE_USD=1.0 will be bumped up to that floor — can't go lower.
+  ~$4.75, so the minimum-share rule can exceed TARGET_NOTIONAL_USD. The order
+  is rejected if its actual notional exceeds MAX_ORDER_NOTIONAL_USD.
 MULTI-ACCOUNT:
   Set to the AUG14 wallet (signature_type=2 / Gnosis Safe). Change ACCOUNT_SUFFIX
   to run elsewhere.
@@ -80,26 +81,29 @@ SIGNATURE_TYPE = 1 if ACCOUNT_SUFFIX == "" else 2
 # ============================================================================
 # STRATEGY CONFIGURATION
 # ============================================================================
-BET_SIZE_USD = float(os.getenv("BET_SIZE_USD", "1.0"))
+TARGET_NOTIONAL_USD = float(os.getenv("TARGET_NOTIONAL_USD", os.getenv("BET_SIZE_USD", "1.0")))
+MAX_ORDER_NOTIONAL_USD = float(os.getenv("MAX_ORDER_NOTIONAL_USD", "5.0"))
 DRY_RUN_FEE_RATE = float(os.getenv("DRY_RUN_FEE_RATE", "0.0"))
 DRY_RUN_SLIPPAGE = float(os.getenv("DRY_RUN_SLIPPAGE", "0.001"))
 ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.95"))
 MAX_BUY_PRICE = float(os.getenv("MAX_BUY_PRICE", "0.95"))
-MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "10.0"))
-MAX_SESSION_LOSS_USD = float(os.getenv("MAX_SESSION_LOSS_USD", "6.0"))
+MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "5.0"))
+MAX_SESSION_LOSS_USD = float(os.getenv("MAX_SESSION_LOSS_USD", "8.0"))
+MAX_POSITION_LOSS_USD = float(os.getenv("MAX_POSITION_LOSS_USD", "4.50"))
 SIM_BANKROLL_USD = float(os.getenv("SIM_BANKROLL_USD", "10.0"))
 MIN_DECIDED_BID = float(os.getenv("MIN_DECIDED_BID", "0.88"))
 MAX_OPPOSITE_BID = float(os.getenv("MAX_OPPOSITE_BID", "0.08"))
 EARLY_WINDOW_MAX_BUY_PRICE = float(os.getenv("EARLY_WINDOW_MAX_BUY_PRICE", "0.93"))
 ENTRY_WINDOW_SEC = int(os.getenv("ENTRY_WINDOW_SEC", "60"))
-STOP_THRESHOLD_SEC = int(os.getenv("STOP_THRESHOLD_SEC", "5"))
+STOP_THRESHOLD_SEC = int(os.getenv("STOP_THRESHOLD_SEC", "10"))
+SOFT_ENTRY_CUTOFF_SEC = int(os.getenv("SOFT_ENTRY_CUTOFF_SEC", "15"))
 ORDER_UPDATE_INTERVAL = int(os.getenv("ORDER_UPDATE_INTERVAL", "1"))
 PRICE_HOLD_TOLERANCE = float(os.getenv("PRICE_HOLD_TOLERANCE", "0.005"))
 KILL_SWITCH_FILE = os.getenv("KILL_SWITCH_FILE", "KILL")
 
 MARKET_DURATION = 300
 ET = timezone(timedelta(hours=-5))
-CRYPTO_ASSETS = {"BTC": "btc", "ETH": "eth", "SOL": "sol", "XRP": "xrp", "DOGE": "doge"}
+CRYPTO_ASSETS = {"BTC": "btc", "ETH": "eth", "SOL": "sol", "XRP": "xrp", "DOGE": "doge", "HYPE": "hype", "BNB": "bnb"}
 BOOK_WORKERS = len(CRYPTO_ASSETS) * 2
 DISCOVERY_RETRY_SEC = 15
 
@@ -125,6 +129,8 @@ SESSION_FILL_PRICES = []
 SESSION_PAPER_PEAK_PNL = 0.0
 SESSION_MAX_DD = 0.0
 SESSION_CURRENT_STREAK = 0
+SESSION_ENTRY_HALT_REASON = None
+SESSION_LATE_FILLS = 0
 SESSION_START = time.time()
 
 # ============================================================================
@@ -754,10 +760,17 @@ def _exposure_limit_usd():
 
 def _place_fresh_bid(state, token_id, target_price):
     global SESSION_ATTEMPTS, SESSION_TIMEOUTS
-    shares = calculate_shares(BET_SIZE_USD, target_price)
+    shares = calculate_shares(TARGET_NOTIONAL_USD, target_price)
     if shares <= 0:
         return
     order_cost = target_price * shares
+    if order_cost > MAX_ORDER_NOTIONAL_USD + 1e-9:
+        log_event(
+            f"Order notional ${order_cost:.2f} exceeds MAX_ORDER_NOTIONAL_USD "
+            f"${MAX_ORDER_NOTIONAL_USD:.2f}; bid rejected",
+            "red",
+        )
+        return
     current = _current_exposure_usd()
     exposure_limit = _exposure_limit_usd()
     if current + order_cost > exposure_limit:
@@ -851,6 +864,41 @@ def _simulate_paper_fills(market_states, market_books):
         )
 
 
+def _update_entry_halt(market_states, market_books):
+    """Halt new entries after session or marked position loss limits are hit."""
+    global SESSION_ENTRY_HALT_REASON
+    if SESSION_ENTRY_HALT_REASON:
+        return
+    if DRY_RUN and SESSION_PAPER_PNL <= -MAX_SESSION_LOSS_USD:
+        SESSION_ENTRY_HALT_REASON = f"session loss reached ${SESSION_PAPER_PNL:.2f}"
+    else:
+        for symbol, state in market_states.items():
+            if not state.get('entered'):
+                continue
+            side = state.get('favored_side')
+            up_book, down_book = market_books.get(symbol, (None, None))
+            held_book = up_book if side == "UP" else down_book if side == "DOWN" else None
+            bid = held_book.get('best_bid') if held_book else None
+            shares = float(state.get('filled_shares') or 0.0)
+            cost = float(state.get('filled_cost') or 0.0)
+            if bid is None or shares <= 0 or cost <= 0:
+                continue
+            marked_pnl = shares * float(bid) - cost
+            if DRY_RUN:
+                marked_pnl -= (float(bid) * DRY_RUN_FEE_RATE + DRY_RUN_SLIPPAGE) * shares
+            if marked_pnl <= -MAX_POSITION_LOSS_USD:
+                SESSION_ENTRY_HALT_REASON = (
+                    f"{symbol} marked loss reached ${marked_pnl:.2f} "
+                    f"(limit -${MAX_POSITION_LOSS_USD:.2f})"
+                )
+                break
+    if SESSION_ENTRY_HALT_REASON:
+        log_event(
+            f"CRITICAL: {SESSION_ENTRY_HALT_REASON}; halting new entries and canceling resting bids",
+            "red",
+        )
+
+
 def _short_address(address):
     if not address:
         return "missing"
@@ -859,9 +907,11 @@ def _short_address(address):
 
 def _validate_configuration():
     numeric_values = {
-        "BET_SIZE_USD": BET_SIZE_USD,
+        "TARGET_NOTIONAL_USD": TARGET_NOTIONAL_USD,
+        "MAX_ORDER_NOTIONAL_USD": MAX_ORDER_NOTIONAL_USD,
         "MAX_TOTAL_EXPOSURE_USD": MAX_TOTAL_EXPOSURE_USD,
         "MAX_SESSION_LOSS_USD": MAX_SESSION_LOSS_USD,
+        "MAX_POSITION_LOSS_USD": MAX_POSITION_LOSS_USD,
         "SIM_BANKROLL_USD": SIM_BANKROLL_USD,
         "ENTRY_THRESHOLD": ENTRY_THRESHOLD,
         "MAX_BUY_PRICE": MAX_BUY_PRICE,
@@ -874,9 +924,11 @@ def _validate_configuration():
     invalid = [name for name, value in numeric_values.items() if not math.isfinite(value)]
     invalid.extend(
         name for name, value in (
-            ("BET_SIZE_USD", BET_SIZE_USD),
+            ("TARGET_NOTIONAL_USD", TARGET_NOTIONAL_USD),
+            ("MAX_ORDER_NOTIONAL_USD", MAX_ORDER_NOTIONAL_USD),
             ("MAX_TOTAL_EXPOSURE_USD", MAX_TOTAL_EXPOSURE_USD),
             ("MAX_SESSION_LOSS_USD", MAX_SESSION_LOSS_USD),
+            ("MAX_POSITION_LOSS_USD", MAX_POSITION_LOSS_USD),
             ("SIM_BANKROLL_USD", SIM_BANKROLL_USD),
         ) if value <= 0
     )
@@ -890,6 +942,8 @@ def _validate_configuration():
         invalid.append("DRY_RUN_FEE_RATE/DRY_RUN_SLIPPAGE")
     if not (0 <= STOP_THRESHOLD_SEC < ENTRY_WINDOW_SEC < MARKET_DURATION):
         invalid.append("STOP_THRESHOLD_SEC/ENTRY_WINDOW_SEC")
+    if not (STOP_THRESHOLD_SEC < SOFT_ENTRY_CUTOFF_SEC < ENTRY_WINDOW_SEC):
+        invalid.append("STOP_THRESHOLD_SEC/SOFT_ENTRY_CUTOFF_SEC/ENTRY_WINDOW_SEC")
     if ORDER_UPDATE_INTERVAL <= 0:
         invalid.append("ORDER_UPDATE_INTERVAL")
     if invalid:
@@ -1407,7 +1461,7 @@ def draw_dashboard(market_states, market_books, time_left):
         _seg(" DRY RUN ", "black", True, "on_light_yellow")
     )
     tagline = [
-        _seg(f"last-{ENTRY_WINDOW_SEC}s maker", C_MUTED),
+        _seg(f"last-{ENTRY_WINDOW_SEC}s maker; no new bids <{SOFT_ENTRY_CUTOFF_SEC}s", C_MUTED),
         _seg(f" {_G['dot']} ", C_BORDER),
         _seg(f"{MAX_BUY_PRICE * 100:.0f}{_G['cent']} cap", C_MUTED),
         _seg(f" {_G['dot']} ", C_BORDER),
@@ -1709,7 +1763,7 @@ def draw_dashboard(market_states, market_books, time_left):
         elif state.get('last_order_id'):
             kind = "SIM BID" if DRY_RUN else "LIVE BID"
             price = float(state.get('last_order_price') or 0.0)
-            shares = calculate_shares(BET_SIZE_USD, price) if price > 0 else 0.0
+            shares = calculate_shares(TARGET_NOTIONAL_USD, price) if price > 0 else 0.0
             edge = shares * (1.0 - price)
             book = up_book if state.get('favored_side') == "UP" else down_book
             queue = (book or {}).get('bid_queue_shares') or 0
@@ -1724,7 +1778,7 @@ def draw_dashboard(market_states, market_books, time_left):
                 if target is None:
                     status = ("SIGNAL / NO BID", C_WARN)
                 else:
-                    shares = calculate_shares(BET_SIZE_USD, target)
+                    shares = calculate_shares(TARGET_NOTIONAL_USD, target)
                     if total_exposure + target * shares > limit:
                         status = ("SIGNAL / CAPPED", C_WARN)
                     else:
@@ -1803,6 +1857,8 @@ def draw_dashboard(market_states, market_books, time_left):
             _kpi("attempts", SESSION_ATTEMPTS),
             _seg("   "),
             _kpi("reprices", SESSION_REPRICES),
+            _seg("   "),
+            _kpi("late fills", SESSION_LATE_FILLS, C_BAD if SESSION_LATE_FILLS else C_TEXT),
         ], content_w),
         _split_row(
             result_bits,
@@ -2071,7 +2127,7 @@ def _clear_order_state(market_state):
 
 def _record_fill(symbol, market_state, fill_status, preserve_open_order=False):
     """Record any matched quantity while keeping its cost reserved this window."""
-    global SESSION_ENTRIES, SESSION_FILL_PRICES
+    global SESSION_ENTRIES, SESSION_FILL_PRICES, SESSION_LATE_FILLS
     if not fill_status:
         return
     matched = float(fill_status.get('size_matched') or 0.0)
@@ -2087,6 +2143,15 @@ def _record_fill(symbol, market_state, fill_status, preserve_open_order=False):
         market_state['filled_cost'] = matched * price
     if not market_state.get('entered'):
         SESSION_ENTRIES += 1
+        market_state['entered_at'] = time.time()
+        if get_time_remaining(market_state.get('market_ts', 0)) <= STOP_THRESHOLD_SEC:
+            market_state['late_fill'] = True
+            SESSION_LATE_FILLS += 1
+            log_event(
+                f"CRITICAL: {symbol} late fill detected inside final {STOP_THRESHOLD_SEC}s; "
+                "position remains exposed to expiry",
+                "red",
+            )
     market_state['entered'] = True
     market_state['entry_fill_price'] = price
     log_event(f"{symbol} matched {matched:.2f} shares @ ${price:.3f}; holding to expiry", "green")
@@ -2391,6 +2456,7 @@ def main():
                 next_book_poll_at = time.monotonic() + book_poll_interval
 
             _simulate_paper_fills(market_states, market_books)
+            _update_entry_halt(market_states, market_books)
 
             now = time.time()
             time_left = get_time_remaining(market_ts)
@@ -2506,6 +2572,17 @@ def main():
                                 _record_fill(symbol, market_state, final_status)
                                 _clear_order_state(market_state)
                             continue
+                        if SESSION_ENTRY_HALT_REASON:
+                            outcome, final_status = _cancel_and_confirm(
+                                market_state['favored_token_id'], order_id, 0.15,
+                                market_state.get('exposure_key'),
+                            )
+                            if outcome == "FILLED":
+                                _record_fill(symbol, market_state, final_status)
+                                _clear_order_state(market_state)
+                            elif outcome == "CANCELED":
+                                _clear_order_state(market_state)
+                            continue
                         favored_book = up_book if market_state.get('favored_side') == "UP" else down_book
                         if favored_book is None:
                             continue
@@ -2565,6 +2642,8 @@ def main():
                 opposite_book = down_book if market_state.get('favored_side') == "UP" else up_book
                 target_price = compute_bid_target(favored_book, time_left, opposite_book)
                 if target_price is not None:
+                    if time_left <= SOFT_ENTRY_CUTOFF_SEC:
+                        continue
                     if market_state.get('sharp_ask_drop', {}).get(market_state.get('favored_side')):
                         if now - market_state.get('last_velocity_log', 0.0) >= 5.0:
                             log_event(
@@ -2595,6 +2674,8 @@ def main():
             for _rank, _symbol, _state, _token_id, _target_price in sorted(
                 new_entry_candidates, key=lambda candidate: candidate[0], reverse=True
             ):
+                if SESSION_ENTRY_HALT_REASON:
+                    break
                 _place_fresh_bid(_state, _token_id, _target_price)
 
             draw_dashboard(market_states, market_books, time_left)
