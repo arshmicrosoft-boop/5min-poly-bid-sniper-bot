@@ -29,6 +29,8 @@ import os
 import time
 import random
 import itertools
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 import requests
 from datetime import datetime, timezone, timedelta
@@ -52,7 +54,7 @@ PAPER_ORDERS = {}
 PAPER_ORDER_SEQUENCE = itertools.count(1)
 
 sys.path.insert(0, PROJECT_ROOT)
-from nice_funcs import calculate_shares, get_token_id
+from nice_funcs import calculate_shares
 
 # ============================================================================
 # ACCOUNT CONFIGURATION (this bot = AUG14)
@@ -80,6 +82,9 @@ PRICE_HOLD_TOLERANCE = 0.005
 
 MARKET_DURATION = 300
 ET = timezone(timedelta(hours=-5))
+CRYPTO_ASSETS = {"BTC": "btc", "ETH": "eth", "SOL": "sol", "XRP": "xrp", "DOGE": "doge"}
+BOOK_WORKERS = len(CRYPTO_ASSETS) * 2
+DISCOVERY_RETRY_SEC = 15
 
 TARGET_GAIN_PCT = (1.0 / MAX_BUY_PRICE - 1.0) * 100.0
 
@@ -332,32 +337,56 @@ def get_order_book(token_id):
     }
 
 
-def get_market_info(market_ts):
-    market_slug = f"btc-updown-5m-{market_ts}"
-    response = requests.get(
-        "https://gamma-api.polymarket.com/markets",
-        params={'slug': market_slug, 'closed': 'false', 'active': 'true'},
-        timeout=10,
-    )
-    if response.status_code != 200:
-        return None
-    markets = response.json()
-    if not markets:
-        return None
-
-    market = markets[0]
-    token_data = get_token_id(market['id'])
-    if len(token_data) != 3:
-        return None
-
-    return {
-        'market_id': market['id'],
-        'up_token_id': token_data[1],
-        'down_token_id': token_data[2],
-        'question': market['question'],
-        'slug': market_slug,
-        'neg_risk': market.get('negRisk', False),
-    }
+def get_market_info(market_ts, symbol):
+    """Fetch one coin's exact 5-minute market, mapping token IDs by outcome label."""
+    prefix = CRYPTO_ASSETS[symbol]
+    market_slug = f"{prefix}-updown-5m-{market_ts}"
+    for attempt in range(2):
+        try:
+            response = requests.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={'slug': market_slug, 'closed': 'false', 'active': 'true'},
+                timeout=8,
+            )
+            if response.status_code != 200:
+                return None
+            markets = response.json()
+            if not markets:
+                return None
+            market = markets[0]
+            token_ids = market.get('clobTokenIds', [])
+            outcomes = market.get('outcomes', [])
+            if isinstance(token_ids, str):
+                token_ids = json.loads(token_ids)
+            if isinstance(outcomes, str):
+                outcomes = json.loads(outcomes)
+            if not isinstance(token_ids, list) or len(token_ids) != 2:
+                return None
+            if not isinstance(outcomes, list) or len(outcomes) != 2:
+                return None
+            token_by_outcome = {
+                str(outcome).strip().lower(): str(token_ids[index])
+                for index, outcome in enumerate(outcomes)
+            }
+            up_token = token_by_outcome.get('up')
+            down_token = token_by_outcome.get('down')
+            if not up_token or not down_token:
+                return None
+            return {
+                'market_id': market.get('id'),
+                'symbol': symbol,
+                'up_token_id': up_token,
+                'down_token_id': down_token,
+                'question': market.get('question', market_slug),
+                'slug': market_slug,
+                'neg_risk': market.get('negRisk', False),
+            }
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            if attempt == 1:
+                log_event(f"{symbol} market lookup failed: {type(exc).__name__}", "yellow")
+            else:
+                time.sleep(0.35)
+    return None
 
 
 def position_shares_for_token(token_id):
@@ -432,12 +461,11 @@ def _place_fresh_bid(state, token_id, target_price):
             state['open_order_price'] = target_price
 
 
-def reset_market_state():
-    """Start a clean tracking state for the next five-minute market."""
-    global state
-    state = {
-        'market_ts': None,
-        'market_info': None,
+def new_market_state(market_ts, market_info):
+    """Create independent order/entry state for one asset's market window."""
+    return {
+        'market_ts': market_ts,
+        'market_info': market_info,
         'neg_risk': False,
         'favored_side': None,
         'favored_token_id': None,
@@ -487,65 +515,51 @@ def _draw_panel(title, rows, color="cyan"):
     print(colored("+" + "-" * (width - 2) + "+", color))
 
 
-def draw_dashboard(up_book=None, down_book=None, time_left=None):
-    """Render one compact terminal frame; avoid flooding redirected output."""
+def draw_dashboard(market_states, market_books, time_left):
+    """Render all discovered coin markets together in one compact dashboard."""
     if not sys.stdout.isatty():
         return
 
-    info = state.get('market_info')
     elapsed = max(0, int(time.time() - SESSION_START))
     left = max(0, int(time_left)) if time_left is not None else MARKET_DURATION
-    if state.get('entered'):
-        phase = f"POSITION OPEN: {state.get('favored_side')} @ ${state.get('entry_fill_price') or 0:.3f}"
-        phase_color = "green"
-    elif left <= STOP_THRESHOLD_SEC:
-        phase, phase_color = "CUTOFF - NO NEW ORDERS", "red"
-    elif left <= ENTRY_WINDOW_SEC:
-        phase, phase_color = "ENTRY WINDOW", "yellow"
-    else:
-        phase, phase_color = "WAITING FOR LAST 60 SECONDS", "white"
-
-    def book_line(name, book):
-        if not book:
-            return f"{name:<5} bid ---.---   ask ---.---   state: unavailable"
-        marker = "DECIDED" if book['best_ask'] >= ENTRY_THRESHOLD else "watching"
-        return f"{name:<5} bid ${book['best_bid']:.3f}   ask ${book['best_ask']:.3f}   {marker}"
-
-    order = "none"
-    if state.get('last_order_id') == 'timeout-assumed-live':
-        order = f"submission uncertain; duplicate blocked at ${state.get('last_order_price') or 0:.3f}"
-    elif state.get('last_order_id'):
-        prefix = "SIMULATED BUY" if DRY_RUN else "BUY"
-        order = f"{prefix} {state.get('favored_side')} @ ${state.get('last_order_price') or 0:.3f} (resting)"
-
-    market_label = info.get('question', info.get('slug', 'market metadata pending')) if info else "market metadata pending"
     runtime = f"{elapsed // 3600:02d}:{(elapsed // 60) % 60:02d}:{elapsed % 60:02d}"
-    api_auth = "configured API credentials" if all(os.getenv(name) for name in (API_KEY_ENV_NAME, API_SECRET_ENV_NAME, PASSPHRASE_ENV_NAME)) else "derive API credentials"
     rows = [
-        f"Mode: {'DRY RUN (no orders sent)' if DRY_RUN else 'LIVE ORDERS'}   |   Account {_short_address(os.getenv(PUBLIC_KEY_ENV_NAME)) if not DRY_RUN else 'not connected'}   |   Runtime {runtime}",
-        f"Market: {market_label}",
-        f"Phase: {phase}   |   Time left: {left:3d}s   |   Entry threshold: ask >= ${ENTRY_THRESHOLD:.2f}",
-        "-" * 74,
-        book_line("UP", up_book),
-        book_line("DOWN", down_book),
-        f"Selected side: {state.get('favored_side') or 'none'}   |   Order: {order}",
-        f"Limit: post-only BUY <= ${MAX_BUY_PRICE:.2f}   |   Budget target ${BET_SIZE_USD:.2f}; 5-share floor (~$4.75 at cap)",
-        f"Session: {SESSION_ENTRIES} filled   {SESSION_ATTEMPTS} order attempts   {SESSION_SKIPS} no-signal checks",
-        "-" * 74,
-        "Recent events:",
+        f"Mode: {'DRY RUN (no orders sent)' if DRY_RUN else 'LIVE ORDERS'}   |   Coins: {len(market_states)}/{len(CRYPTO_ASSETS)}   |   Runtime {runtime}",
+        f"Final {ENTRY_WINDOW_SEC}s only | ask >= ${ENTRY_THRESHOLD:.2f} | post-only bid <= ${MAX_BUY_PRICE:.2f} | {left:3d}s left",
+        "SYMBOL  UP bid/ask       DOWN bid/ask     SIGNAL / ORDER",
     ]
+    for symbol in CRYPTO_ASSETS:
+        market_state = market_states.get(symbol)
+        if not market_state:
+            rows.append(f"{symbol:<6} market unavailable in this window")
+            continue
+        up_book, down_book = market_books.get(symbol, (None, None))
+        def quote(book):
+            return f"{book['best_bid']:.3f}/{book['best_ask']:.3f}" if book else "---/---"
+        side = market_state.get('favored_side') or "watching"
+        if market_state.get('last_order_id'):
+            kind = "SIM" if DRY_RUN else "LIVE"
+            order = f"{kind} {side} @ {market_state.get('last_order_price') or 0:.3f}"
+        else:
+            order = "no order"
+        rows.append(f"{symbol:<6} {quote(up_book):<15} {quote(down_book):<15} {side} / {order}")
+    rows.extend([
+        f"Session: {SESSION_ENTRIES} fills   {SESSION_ATTEMPTS} order attempts   {SESSION_SKIPS} no-signal checks",
+        "Recent events:",
+    ])
     if EVENT_LOG:
         rows.extend(f"{ts}  {msg}" for ts, msg, _ in EVENT_LOG)
     else:
         rows.append("Starting up; waiting for market data.")
 
     print("\033[2J\033[H", end="")
-    _draw_panel("POLYMARKET 5-MINUTE 95-CENT BID SNIPER", rows)
+    _draw_panel("POLYMARKET MULTI-CRYPTO 5-MINUTE BID SNIPER", rows)
     footer = "Dry-run order state is in memory only; Ctrl+C clears it." if DRY_RUN else "Ctrl+C stops the bot. Check for any remaining live orders."
-    print(colored(footer, phase_color))
+    color = "yellow" if left <= ENTRY_WINDOW_SEC else "green"
+    print(colored(footer, color))
 
 
-def draw_scoreboard():
+def draw_scoreboard(market_states):
     """Print a compact session summary when the bot stops."""
     elapsed = max(0, int(time.time() - SESSION_START))
     runtime = f"{elapsed // 3600:02d}:{(elapsed // 60) % 60:02d}:{elapsed % 60:02d}"
@@ -555,18 +569,12 @@ def draw_scoreboard():
     print(f"Filled entries:   {SESSION_ENTRIES}")
     print(f"Order attempts:   {SESSION_ATTEMPTS}")
     print(f"No-signal checks: {SESSION_SKIPS}")
-    if state.get('entered'):
-        print(colored(
-            f"Position held:    {state.get('favored_side')} @ ${state.get('entry_fill_price') or 0:.3f}",
-            "green",
-        ))
-    elif state.get('last_order_id') and DRY_RUN:
-        print(colored("Open simulated order was kept in memory only; it disappears when the process exits.", "yellow"))
-    elif state.get('last_order_id'):
-        print(colored(
-            "Unfilled resting order may remain — verify on Polymarket before walking away.",
-            "yellow",
-        ))
+    for symbol, market_state in market_states.items():
+        if market_state.get('entered'):
+            print(f"{symbol} held {market_state.get('favored_side')} @ ${market_state.get('entry_fill_price') or 0:.3f}")
+        elif market_state.get('last_order_id'):
+            suffix = "simulated order remains in memory" if DRY_RUN else "verify/cancel on Polymarket"
+            print(colored(f"{symbol}: open order {suffix}", "yellow"))
     print(colored("-" * 40, "cyan"))
 
 
@@ -593,7 +601,7 @@ def _poll_book(token_id, side_label):
         return None
 
 
-def main():
+def legacy_main():
     global SESSION_SKIPS, SESSION_ENTRIES
     _validate_configuration()
     reset_market_state()
@@ -732,6 +740,193 @@ def main():
             cancel_token_orders_acct(state['favored_token_id'])
         print(colored("\nStopped by user.", "yellow"))
         draw_scoreboard()
+
+
+def main():
+    global SESSION_SKIPS, SESSION_ENTRIES
+    _validate_configuration()
+    market_states = {}
+    market_books = {}
+    executor = ThreadPoolExecutor(max_workers=BOOK_WORKERS, thread_name_prefix="market-data")
+    current_market_ts = None
+    next_discovery_at = 0.0
+    log_event(
+        "Multi-crypto bot started in DRY RUN; no account orders will be sent" if DRY_RUN
+        else "Multi-crypto bot started in LIVE ORDER mode",
+        "yellow" if DRY_RUN else "green",
+    )
+
+    try:
+        while True:
+            now = time.time()
+            market_ts = get_current_market_timestamp()
+            time_left = get_time_remaining(market_ts)
+
+            if market_ts != current_market_ts:
+                for old_state in market_states.values():
+                    order_id = old_state.get('last_order_id')
+                    token_id = old_state.get('favored_token_id')
+                    if order_id and token_id and not old_state.get('entered'):
+                        if order_id == 'timeout-assumed-live':
+                            cancel_token_orders_acct(token_id)
+                        else:
+                            _cancel_and_confirm(token_id, order_id)
+                current_market_ts = market_ts
+                market_states = {}
+                market_books = {}
+                log_event(f"New multi-crypto market window {market_ts}", "cyan")
+                futures = {
+                    executor.submit(get_market_info, market_ts, symbol): symbol
+                    for symbol in CRYPTO_ASSETS
+                }
+                for future in as_completed(futures):
+                    symbol = futures[future]
+                    try:
+                        info = future.result()
+                    except Exception as exc:
+                        info = None
+                        log_event(f"{symbol} market discovery failed: {type(exc).__name__}", "yellow")
+                    if info:
+                        market_states[symbol] = new_market_state(market_ts, info)
+                        market_states[symbol]['neg_risk'] = info.get('neg_risk', False)
+                        market_books[symbol] = (None, None)
+                        log_event(f"{symbol} market tokens loaded", "green")
+                next_discovery_at = time.time() + DISCOVERY_RETRY_SEC
+                if not market_states:
+                    log_event("No target crypto markets listed yet; will retry", "yellow")
+
+            missing = [symbol for symbol in CRYPTO_ASSETS if symbol not in market_states]
+            if missing and now >= next_discovery_at:
+                futures = {
+                    executor.submit(get_market_info, market_ts, symbol): symbol
+                    for symbol in missing
+                }
+                for future in as_completed(futures):
+                    symbol = futures[future]
+                    try:
+                        info = future.result()
+                    except Exception as exc:
+                        info = None
+                        log_event(f"{symbol} market discovery failed: {type(exc).__name__}", "yellow")
+                    if info:
+                        market_states[symbol] = new_market_state(market_ts, info)
+                        market_states[symbol]['neg_risk'] = info.get('neg_risk', False)
+                        market_books[symbol] = (None, None)
+                        log_event(f"{symbol} market tokens loaded", "green")
+                next_discovery_at = time.time() + DISCOVERY_RETRY_SEC
+
+            # Poll all discovered token books concurrently to keep the shared
+            # entry window responsive when a public endpoint is slow.
+            book_futures = {}
+            for symbol, market_state in market_states.items():
+                info = market_state['market_info']
+                book_futures[executor.submit(_poll_book, info['up_token_id'], f"{symbol} UP")] = (symbol, "UP")
+                book_futures[executor.submit(_poll_book, info['down_token_id'], f"{symbol} DOWN")] = (symbol, "DOWN")
+            fresh_books = {symbol: {"UP": None, "DOWN": None} for symbol in market_states}
+            for future in as_completed(book_futures):
+                symbol, side = book_futures[future]
+                try:
+                    fresh_books[symbol][side] = future.result()
+                except Exception as exc:
+                    log_event(f"{symbol} {side} book poll failed: {type(exc).__name__}", "yellow")
+            for symbol, books in fresh_books.items():
+                previous = market_books.get(symbol, (None, None))
+                market_books[symbol] = (books["UP"] or previous[0], books["DOWN"] or previous[1])
+
+            time_left = get_time_remaining(market_ts)
+            in_window = ENTRY_WINDOW_SEC >= time_left > STOP_THRESHOLD_SEC
+            for symbol, market_state in market_states.items():
+                up_book, down_book = market_books.get(symbol, (None, None))
+
+                if (not market_state['entered'] and time_left <= STOP_THRESHOLD_SEC
+                        and market_state['last_order_id'] and market_state['favored_token_id']):
+                    order_id = market_state['last_order_id']
+                    if order_id == 'timeout-assumed-live':
+                        cancel_token_orders_acct(market_state['favored_token_id'])
+                        log_event(f"{symbol} cutoff reached; cancel requested for uncertain order", "yellow")
+                    elif _cancel_and_confirm(market_state['favored_token_id'], order_id):
+                        market_state['last_order_id'] = None
+                        market_state['last_order_price'] = None
+                        market_state['open_order_price'] = None
+                        log_event(f"{symbol} cutoff reached; order canceled", "yellow")
+
+                if not (in_window and up_book and down_book and not market_state['entered']
+                        and now - market_state['last_order_update'] >= ORDER_UPDATE_INTERVAL):
+                    continue
+                market_state['last_order_update'] = now
+                if market_state['favored_side'] is None:
+                    side, _ = pick_decided_side(up_book, down_book)
+                    if side:
+                        market_state['favored_side'] = side
+                        token_key = 'up_token_id' if side == "UP" else 'down_token_id'
+                        market_state['favored_token_id'] = market_state['market_info'][token_key]
+                        log_event(f"{symbol} {side} crossed the decided threshold", "green")
+                    else:
+                        SESSION_SKIPS += 1
+
+                if market_state['favored_side'] is None:
+                    continue
+                token_id = market_state['favored_token_id']
+                favored_book = up_book if market_state['favored_side'] == "UP" else down_book
+                shares_held = position_shares_for_token(token_id)
+                if shares_held > 0:
+                    market_state['entered'] = True
+                    market_state['entry_fill_price'] = market_state['last_order_price'] or 0.0
+                    SESSION_ENTRIES += 1
+                    log_event(f"{symbol} position detected ({shares_held:.2f} shares); holding to expiry", "green")
+                    continue
+                if market_state['last_order_id'] == 'timeout-assumed-live':
+                    market_state['entered'] = True
+                    continue
+                if market_state['last_order_id']:
+                    order_id = market_state['last_order_id']
+                    status = get_order_status_for_id(order_id)
+                    if status == "ERROR" or status is None:
+                        continue
+                    if status['is_filled']:
+                        market_state['entered'] = True
+                        market_state['entry_fill_price'] = status['price'] or market_state['last_order_price'] or 0.0
+                        SESSION_ENTRIES += 1
+                        log_event(f"{symbol} order filled; holding to expiry", "green")
+                        continue
+                    if status['status'] == 'LIVE':
+                        target_price = compute_bid_target(favored_book)
+                        old_price = status['price'] or market_state['last_order_price']
+                        if target_price is None:
+                            if _cancel_and_confirm(token_id, order_id):
+                                market_state['last_order_id'] = None
+                                market_state['last_order_price'] = None
+                                market_state['open_order_price'] = None
+                                log_event(f"{symbol} side no longer decided; order canceled", "yellow")
+                        elif old_price and abs(old_price - target_price) > PRICE_HOLD_TOLERANCE:
+                            if _cancel_and_confirm(token_id, order_id):
+                                market_state['last_order_id'] = None
+                                market_state['last_order_price'] = None
+                                market_state['open_order_price'] = None
+                                _place_fresh_bid(market_state, token_id, target_price)
+                    elif status['status'] in ('CANCELED', 'CANCELLED', 'NOT_FOUND'):
+                        market_state['last_order_id'] = None
+                        market_state['last_order_price'] = None
+                        market_state['open_order_price'] = None
+                        target_price = compute_bid_target(favored_book)
+                        if target_price is not None:
+                            _place_fresh_bid(market_state, token_id, target_price)
+                else:
+                    target_price = compute_bid_target(favored_book)
+                    if target_price is not None:
+                        _place_fresh_bid(market_state, token_id, target_price)
+
+            draw_dashboard(market_states, market_books, time_left)
+            time.sleep(1.0)
+
+    except KeyboardInterrupt:
+        for market_state in market_states.values():
+            if market_state.get('last_order_id') and market_state.get('favored_token_id') and not market_state.get('entered'):
+                cancel_token_orders_acct(market_state['favored_token_id'])
+        print(colored("\nStopped by user.", "yellow"))
+        draw_scoreboard(market_states)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 if __name__ == "__main__":
