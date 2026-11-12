@@ -774,9 +774,21 @@ def _resolve_paper_window(market_states, market_books):
     for symbol, state in market_states.items():
         if not state.get('entered') or state.get('paper_resolved'):
             continue
+        order_id = str(state.get('last_order_id') or '')
+        if DRY_RUN and not order_id.startswith('paper-'):
+            state['paper_resolved'] = True
+            continue
         shares = float(state.get('filled_shares') or 0.0)
         cost = float(state.get('filled_cost') or 0.0)
+        # In dry run, derive shares/cost from the paper order, not real positions.
+        if DRY_RUN and order_id.startswith('paper-') and order_id in PAPER_ORDERS:
+            po = PAPER_ORDERS[order_id]
+            shares = float(po.get('size') or 0.0)
+            cost = float(po.get('price') or 0.0) * shares
+            state['filled_shares'] = shares
+            state['filled_cost'] = cost
         if shares <= 0 or cost <= 0:
+            state['paper_resolved'] = True
             continue
         up_book, down_book = market_books.get(symbol, (None, None))
         favored = up_book if state.get('favored_side') == "UP" else down_book
