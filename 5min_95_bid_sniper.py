@@ -32,6 +32,7 @@ import itertools
 import json
 import threading
 import shutil
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 import requests
@@ -190,6 +191,7 @@ def log_event(msg, color="white"):
         marker in msg.lower()
         for marker in (
             "dry run:", "resting", "order live", "matched", "crossed", "cancel",
+            "paper fill", "paper win", "paper loss", "paper outcome",
             "exposure cap", "skipping bid",
         )
     )
@@ -580,9 +582,9 @@ def get_market_info(market_ts, symbol):
     return None
 
 
-def position_shares_for_token(token_id):
+def _account_positions_by_token():
     if DRY_RUN:
-        return 0.0
+        return {}
     user_address = os.getenv(PUBLIC_KEY_ENV_NAME)
     if not user_address:
         return None
@@ -594,15 +596,23 @@ def position_shares_for_token(token_id):
         )
         if resp.status_code != 200:
             return None
+        positions = {}
         for pos in resp.json():
-            if str(pos.get('asset')) == str(token_id):
-                size = float(pos.get('size', 0) or 0)
-                if size > 0:
-                    return size
-        return 0.0
+            asset = str(pos.get('asset') or '')
+            size = float(pos.get('size', 0) or 0)
+            if asset and size > 0:
+                positions[asset] = positions.get(asset, 0.0) + size
+        return positions
     except Exception as e:
         log_event(f"positions fetch failed: {e}", "yellow")
         return None
+
+
+def position_shares_for_token(token_id):
+    positions = _account_positions_by_token()
+    if positions is None:
+        return None
+    return float(positions.get(str(token_id), 0.0))
 
 
 def _reconcile_startup_positions(market_states):
@@ -615,31 +625,46 @@ def _reconcile_startup_positions(market_states):
     """
     if DRY_RUN:
         return
+    positions = _account_positions_by_token()
     for symbol, state in market_states.items():
         info = state.get("market_info") or {}
+        holdings = []
+        unknown = positions is None
+        if unknown:
+            state['position_check_unknown'] = True
+            log_event(f"{symbol} startup positions unavailable; entries paused for this window", "red")
+            continue
         for side, key in (("UP", "up_token_id"), ("DOWN", "down_token_id")):
             token_id = info.get(key)
             if not token_id:
                 continue
-            shares = position_shares_for_token(token_id)
+            shares = positions.get(str(token_id), 0.0)
             if not shares or shares <= 0:
                 continue
-            if state.get("entered"):
-                continue
-            state["favored_side"] = side
-            state["favored_token_id"] = str(token_id)
+            holdings.append((side, str(token_id), float(shares)))
+        if holdings:
+            total_shares = sum(shares for _, _, shares in holdings)
+            state["favored_side"] = holdings[0][0] if len(holdings) == 1 else "BOTH"
+            state["favored_token_id"] = holdings[0][1] if len(holdings) == 1 else None
             state["entered"] = True
-            state["filled_shares"] = float(shares)
+            state["filled_shares"] = total_shares
             state["entry_fill_price"] = MAX_BUY_PRICE
-            state["filled_cost"] = float(shares) * MAX_BUY_PRICE
+            state["filled_cost"] = total_shares * MAX_BUY_PRICE
             state["signal_counted"] = True
-            exposure_key = f"startup:{symbol}:{side}"
+            exposure_key = f"startup:{symbol}:position"
             state["exposure_key"] = exposure_key
             OPEN_ORDER_COSTS[exposure_key] = state["filled_cost"]
             log_event(
-                f"{symbol} startup reconciliation: adopted {shares:.2f} {side} "
+                f"{symbol} startup reconciliation: adopted {total_shares:.2f} "
+                f"{'/'.join(side for side, _, _ in holdings)} "
                 f"shares already on book (reserved ${state['filled_cost']:.2f})",
                 "yellow",
+            )
+        state['position_check_unknown'] = unknown
+        if unknown:
+            log_event(
+                f"{symbol} startup positions could not be fully checked; entries paused for this window",
+                "red",
             )
 
 
@@ -720,6 +745,13 @@ def _current_exposure_usd():
     return sum(OPEN_ORDER_COSTS.values())
 
 
+def _exposure_limit_usd():
+    """Apply both configured portfolio cap and simulated available bankroll."""
+    if DRY_RUN:
+        return min(MAX_TOTAL_EXPOSURE_USD, max(0.0, SIM_BANKROLL_USD + SESSION_PAPER_PNL))
+    return MAX_TOTAL_EXPOSURE_USD
+
+
 def _place_fresh_bid(state, token_id, target_price):
     global SESSION_ATTEMPTS, SESSION_TIMEOUTS
     shares = calculate_shares(BET_SIZE_USD, target_price)
@@ -727,9 +759,10 @@ def _place_fresh_bid(state, token_id, target_price):
         return
     order_cost = target_price * shares
     current = _current_exposure_usd()
-    if current + order_cost > MAX_TOTAL_EXPOSURE_USD:
+    exposure_limit = _exposure_limit_usd()
+    if current + order_cost > exposure_limit:
         log_event(
-            f"Exposure cap reached (${current:.2f}+${order_cost:.2f} > ${MAX_TOTAL_EXPOSURE_USD:.2f}); skipping bid",
+            f"Exposure cap reached (${current:.2f}+${order_cost:.2f} > ${exposure_limit:.2f}); skipping bid",
             "yellow",
         )
         return
@@ -737,6 +770,9 @@ def _place_fresh_bid(state, token_id, target_price):
     resp = place_limit_order(token_id, "BUY", target_price, shares, neg_risk=state['neg_risk'])
     if resp:
         oid = resp.get('orderID')
+        if resp.get('success') and not oid:
+            log_event("Order accepted without an ID; treating it as uncertain", "yellow")
+            oid = 'timeout-assumed-live'
         if oid and oid != 'timeout-assumed-live':
             state['last_order_id'] = oid
             state['last_order_price'] = target_price
@@ -795,11 +831,13 @@ def _simulate_paper_fills(market_states, market_books):
             continue
         order['status'] = 'MATCHED'
         order['size_matched'] = float(order['size'])
-        SESSION_FILL_PRICES.append(float(order['price']))
         # Propagate the simulated fill into market state so capital/risk and
-        # PnL reflect it immediately (not only at window rollover).
+        # PnL reflect it immediately (not only at window rollover). The shared
+        # fill recorder adds this price once when the main loop observes it.
         state['filled_shares'] = float(order['size'])
         state['filled_cost'] = float(order['price']) * float(order['size'])
+        state['paper_filled'] = True
+        state['paper_fill_price'] = float(order['price'])
         if not state.get('entered'):
             SESSION_ENTRIES += 1
         state['entered'] = True
@@ -820,6 +858,43 @@ def _short_address(address):
 
 
 def _validate_configuration():
+    numeric_values = {
+        "BET_SIZE_USD": BET_SIZE_USD,
+        "MAX_TOTAL_EXPOSURE_USD": MAX_TOTAL_EXPOSURE_USD,
+        "MAX_SESSION_LOSS_USD": MAX_SESSION_LOSS_USD,
+        "SIM_BANKROLL_USD": SIM_BANKROLL_USD,
+        "ENTRY_THRESHOLD": ENTRY_THRESHOLD,
+        "MAX_BUY_PRICE": MAX_BUY_PRICE,
+        "MIN_DECIDED_BID": MIN_DECIDED_BID,
+        "MAX_OPPOSITE_BID": MAX_OPPOSITE_BID,
+        "EARLY_WINDOW_MAX_BUY_PRICE": EARLY_WINDOW_MAX_BUY_PRICE,
+        "DRY_RUN_FEE_RATE": DRY_RUN_FEE_RATE,
+        "DRY_RUN_SLIPPAGE": DRY_RUN_SLIPPAGE,
+    }
+    invalid = [name for name, value in numeric_values.items() if not math.isfinite(value)]
+    invalid.extend(
+        name for name, value in (
+            ("BET_SIZE_USD", BET_SIZE_USD),
+            ("MAX_TOTAL_EXPOSURE_USD", MAX_TOTAL_EXPOSURE_USD),
+            ("MAX_SESSION_LOSS_USD", MAX_SESSION_LOSS_USD),
+            ("SIM_BANKROLL_USD", SIM_BANKROLL_USD),
+        ) if value <= 0
+    )
+    if not (0 < ENTRY_THRESHOLD < 1 and 0 < MAX_BUY_PRICE <= 1):
+        invalid.append("ENTRY_THRESHOLD/MAX_BUY_PRICE")
+    if not (0 < EARLY_WINDOW_MAX_BUY_PRICE <= MAX_BUY_PRICE):
+        invalid.append("EARLY_WINDOW_MAX_BUY_PRICE")
+    if not (0 <= MAX_OPPOSITE_BID < 1 and 0 <= MIN_DECIDED_BID < 1):
+        invalid.append("MIN_DECIDED_BID/MAX_OPPOSITE_BID")
+    if DRY_RUN_FEE_RATE < 0 or DRY_RUN_SLIPPAGE < 0:
+        invalid.append("DRY_RUN_FEE_RATE/DRY_RUN_SLIPPAGE")
+    if not (0 <= STOP_THRESHOLD_SEC < ENTRY_WINDOW_SEC < MARKET_DURATION):
+        invalid.append("STOP_THRESHOLD_SEC/ENTRY_WINDOW_SEC")
+    if ORDER_UPDATE_INTERVAL <= 0:
+        invalid.append("ORDER_UPDATE_INTERVAL")
+    if invalid:
+        raise SystemExit("Invalid configuration values: " + ", ".join(dict.fromkeys(invalid)))
+
     if DRY_RUN:
         return
     missing = [name for name in (PRIVATE_KEY_ENV_NAME, PUBLIC_KEY_ENV_NAME) if not os.getenv(name)]
@@ -847,19 +922,11 @@ def _resolve_paper_window(market_states, market_books):
     for symbol, state in market_states.items():
         if not state.get('entered') or state.get('paper_resolved'):
             continue
-        order_id = str(state.get('last_order_id') or '')
-        if DRY_RUN and not order_id.startswith('paper-'):
+        if not state.get('paper_filled'):
             state['paper_resolved'] = True
             continue
         shares = float(state.get('filled_shares') or 0.0)
         cost = float(state.get('filled_cost') or 0.0)
-        # In dry run, derive shares/cost from the paper order, not real positions.
-        if DRY_RUN and order_id.startswith('paper-') and order_id in PAPER_ORDERS:
-            po = PAPER_ORDERS[order_id]
-            shares = float(po.get('size') or 0.0)
-            cost = float(po.get('price') or 0.0) * shares
-            state['filled_shares'] = shares
-            state['filled_cost'] = cost
         if shares <= 0 or cost <= 0:
             state['paper_resolved'] = True
             continue
@@ -872,23 +939,18 @@ def _resolve_paper_window(market_states, market_books):
         opposite = down_book if state.get('favored_side') == "UP" else up_book
         favored_bid = favored.get('best_bid') if favored else None
         opposite_bid = opposite.get('best_bid') if opposite else None
-        # Resolve on the final cached book. Prefer a decisive 0.98+ bid, but fall
-        # back to whichever side is leading so dry-run stats are never stuck at 0.
-        if favored_bid is not None and opposite_bid is not None:
-            if favored_bid >= 0.90 or favored_bid > opposite_bid:
-                result = "WIN"
-            else:
-                result = "LOSS"
-        elif favored_bid is not None and favored_bid >= 0.90:
+        # Only count a result when the final cached book has a strong one-sided
+        # signal; a missing/ambiguous book is unresolved, never an assumed win.
+        if favored_bid is not None and favored_bid >= 0.98:
             result = "WIN"
-        elif opposite_bid is not None and opposite_bid >= 0.90:
+        elif opposite_bid is not None and opposite_bid >= 0.98:
             result = "LOSS"
         else:
-            # No cached book at rollover; assume the decided side won (proxy).
-            result = "WIN"
-            log_event(f"{symbol} paper outcome unresolved; assuming WIN (proxy)", "yellow")
+            state['paper_resolved'] = True
+            log_event(f"{symbol} paper outcome unresolved from final cached book; excluded from results", "yellow")
+            continue
 
-        entry = float(state.get('last_order_price') or 0.0)
+        entry = float(state.get('paper_fill_price') or state.get('entry_fill_price') or 0.0)
         if entry <= 0 and shares > 0:
             entry = cost / shares
         state['paper_resolved'] = True
@@ -1322,7 +1384,7 @@ def draw_dashboard(market_states, market_books, time_left):
                 open_bid_shares += max(0.0, reserved - float(state.get('filled_cost') or 0.0)) / order_price
     total_exposure = _current_exposure_usd()
     other_reserved = max(0.0, total_exposure - open_bid_cost - filled_cost)
-    limit = MAX_TOTAL_EXPOSURE_USD if MAX_TOTAL_EXPOSURE_USD > 0 else 0.0
+    limit = max(0.0, _exposure_limit_usd())
     exposure_ratio = min(1.0, total_exposure / limit) if limit else 1.0
     free_capacity = max(0.0, limit - total_exposure)
     exposure_color = (
@@ -1625,7 +1687,9 @@ def draw_dashboard(market_states, market_books, time_left):
         else:
             gap_text, gap_color = "--", C_MUTED
 
-        if state.get('entered'):
+        if state.get('position_check_unknown') and not state.get('entered'):
+            status = ("POSITIONS UNKNOWN / PAUSED", C_BAD)
+        elif state.get('entered'):
             status = (
                 f"HOLD {float(state.get('filled_shares') or 0):.2f}sh "
                 f"@ {float(state.get('entry_fill_price') or 0):.3f}",
@@ -1650,7 +1714,7 @@ def draw_dashboard(market_states, market_books, time_left):
                     status = ("SIGNAL / NO BID", C_WARN)
                 else:
                     shares = calculate_shares(BET_SIZE_USD, target)
-                    if total_exposure + target * shares > MAX_TOTAL_EXPOSURE_USD:
+                    if total_exposure + target * shares > limit:
                         status = ("SIGNAL / CAPPED", C_WARN)
                     else:
                         edge = shares * (1.0 - target)
@@ -1697,7 +1761,7 @@ def draw_dashboard(market_states, market_books, time_left):
             sum(SESSION_FILL_PRICES) / len(SESSION_FILL_PRICES)
             if SESSION_FILL_PRICES else 0.0
         )
-        be_wr = avg_fill * 100.0
+        be_wr = (avg_fill * (1.0 + DRY_RUN_FEE_RATE) + DRY_RUN_SLIPPAGE) * 100.0
         result_bits = [
             _kpi("paper", f"{SESSION_PAPER_WINS}W/{SESSION_PAPER_LOSSES}L"),
             _seg("  "),
@@ -1742,7 +1806,11 @@ def draw_dashboard(market_states, market_books, time_left):
                 _kpi("streak", f"{SESSION_CURRENT_STREAK:+d}",
                      C_GOOD if SESSION_CURRENT_STREAK > 0 else C_BAD if SESSION_CURRENT_STREAK < 0 else C_MUTED),
                 _seg("   "),
-                _kpi("kill", f"-${MAX_SESSION_LOSS_USD:.0f}", C_MUTED),
+                _kpi(
+                    "kill" if DRY_RUN else "manual kill",
+                    f"-${MAX_SESSION_LOSS_USD:.0f}" if DRY_RUN else "k/q",
+                    C_MUTED,
+                ),
             ],
             content_w,
         ),
@@ -2048,6 +2116,8 @@ def main():
     next_discovery_at = 0.0
     next_book_poll_at = 0.0
     last_book_poll_interval = 3.0
+    book_future = None
+    book_future_market_ts = None
     log_event(
         "Multi-crypto bot started in DRY RUN; no account orders will be sent" if DRY_RUN
         else "Multi-crypto bot started in LIVE ORDER mode",
@@ -2074,8 +2144,15 @@ def main():
     try:
         while True:
             # ---- Kill switch: file trigger (create `KILL` file) or press 'k'/'q' ----
+            kill_switch_path = (
+                None if not KILL_SWITCH_FILE else
+                KILL_SWITCH_FILE if os.path.isabs(KILL_SWITCH_FILE)
+                else os.path.join(PROJECT_ROOT, KILL_SWITCH_FILE)
+            )
+            loss_limit_hit = DRY_RUN and SESSION_PAPER_PNL <= -MAX_SESSION_LOSS_USD
             kill_triggered = (
-                os.path.exists(KILL_SWITCH_FILE)
+                (kill_switch_path is not None and os.path.exists(kill_switch_path))
+                or loss_limit_hit
                 or os.getenv("KILL_SWITCH", "").strip().lower() in {"1", "true", "yes", "on"}
             )
             if not kill_triggered and msvcrt is not None:
@@ -2087,7 +2164,8 @@ def main():
                 except Exception:
                     pass
             if kill_triggered:
-                log_event("KILL SWITCH triggered - canceling all open orders and shutting down", "red")
+                reason = "paper session loss limit reached" if loss_limit_hit else "kill switch triggered"
+                log_event(f"{reason} - canceling all open orders and shutting down", "red")
                 cancel_futures = {
                     executor.submit(
                         _cancel_and_confirm,
@@ -2107,8 +2185,8 @@ def main():
                         outcome, status = "FAILED", None
                     settle_cancel(sym, ms, outcome, status)
                 try:
-                    if os.path.exists(KILL_SWITCH_FILE):
-                        os.remove(KILL_SWITCH_FILE)
+                    if os.path.exists(kill_switch_path):
+                        os.remove(kill_switch_path)
                 except Exception:
                     pass
                 break
@@ -2164,6 +2242,9 @@ def main():
                 OPEN_ORDER_COSTS.clear()
                 OPEN_ORDER_COSTS.update(unresolved_costs)
                 _resolve_paper_window(previous_states, market_books)
+                for paper_id, paper_order in list(PAPER_ORDERS.items()):
+                    if paper_order.get('status') != 'LIVE':
+                        PAPER_ORDERS.pop(paper_id, None)
 
                 current_market_ts = market_ts
                 market_states = {}
@@ -2201,6 +2282,7 @@ def main():
                     executor.submit(get_market_info, market_ts, symbol): symbol
                     for symbol in missing
                 }
+                newly_discovered = {}
                 for future in as_completed(futures):
                     symbol = futures[future]
                     try:
@@ -2212,7 +2294,13 @@ def main():
                         market_states[symbol] = new_market_state(market_ts, info)
                         market_states[symbol]['neg_risk'] = info.get('neg_risk', False)
                         market_books[symbol] = (None, None)
+                        newly_discovered[symbol] = market_states[symbol]
                         log_event(f"{symbol} market tokens loaded", "green")
+                # Markets discovered after startup need the same live-position
+                # check as markets found in the initial lookup. Otherwise a
+                # delayed listing could be entered despite an existing holding.
+                if newly_discovered and not DRY_RUN:
+                    _reconcile_startup_positions(newly_discovered)
                 next_discovery_at = time.time() + DISCOVERY_RETRY_SEC
 
             time_left = get_time_remaining(market_ts)
@@ -2251,15 +2339,29 @@ def main():
             if book_poll_interval < last_book_poll_interval:
                 next_book_poll_at = 0.0
             last_book_poll_interval = book_poll_interval
-            if time.monotonic() >= next_book_poll_at:
-                # A book may validly have only bids or only asks; evaluate each
-                # outcome independently and keep the previous frame between polls.
-                market_books = _poll_books_batch(market_states)
-                for _symbol, _books in market_books.items():
-                    if _symbol in market_states:
-                        market_states[_symbol]['_last_up_book'] = _books[0] if isinstance(_books, tuple) else None
-                        market_states[_symbol]['_last_down_book'] = _books[1] if isinstance(_books, tuple) else None
-                _update_ask_momentum(market_states, market_books)
+            if book_future is not None and book_future.done():
+                try:
+                    fresh_books = book_future.result()
+                    if book_future_market_ts == market_ts:
+                        market_books = fresh_books
+                        for _symbol, _books in market_books.items():
+                            if _symbol in market_states:
+                                market_states[_symbol]['_last_up_book'] = _books[0] if isinstance(_books, tuple) else None
+                                market_states[_symbol]['_last_down_book'] = _books[1] if isinstance(_books, tuple) else None
+                        _update_ask_momentum(market_states, market_books)
+                except Exception as exc:
+                    log_event(f"Batch order-book poll failed: {type(exc).__name__}", "yellow")
+                book_future = None
+                book_future_market_ts = None
+            if time.monotonic() >= next_book_poll_at and book_future is None:
+                # Keep network waits off the order-management loop so slow book
+                # requests cannot delay cutoff or emergency cancellation.
+                state_snapshot = {
+                    symbol: {'market_info': state['market_info']}
+                    for symbol, state in market_states.items()
+                }
+                book_future = executor.submit(_poll_books_batch, state_snapshot)
+                book_future_market_ts = market_ts
                 next_book_poll_at = time.monotonic() + book_poll_interval
 
             _simulate_paper_fills(market_states, market_books)
@@ -2267,8 +2369,15 @@ def main():
             now = time.time()
             time_left = get_time_remaining(market_ts)
             in_window = ENTRY_WINDOW_SEC >= time_left > STOP_THRESHOLD_SEC
-            for symbol, market_state in market_states.items():
+            new_entry_candidates = []
+            asset_priority = {symbol: index for index, symbol in enumerate(CRYPTO_ASSETS)}
+            for symbol in CRYPTO_ASSETS:
+                market_state = market_states.get(symbol)
+                if market_state is None:
+                    continue
                 if not in_window:
+                    continue
+                if market_state.get('position_check_unknown') and not market_state.get('entered'):
                     continue
                 up_book, down_book = market_books.get(symbol, (None, None))
                 side = market_state.get('favored_side')
@@ -2438,10 +2547,29 @@ def main():
                             )
                             market_state['last_velocity_log'] = now
                         continue
-                    _place_fresh_bid(market_state, market_state['favored_token_id'], target_price)
+                    best_bid = favored_book.get('best_bid') if favored_book else None
+                    ask = favored_book.get('best_ask') if favored_book else None
+                    queue_shares = favored_book.get('bid_queue_shares', 0.0) if favored_book else 0.0
+                    # Resolve simultaneous signals consistently: strongest ask
+                    # first, then orders already at the top bid, then the
+                    # shortest queue, with CRYPTO_ASSETS as the stable tie-break.
+                    rank = (
+                        float(ask) if ask is not None else 0.0,
+                        int(best_bid is not None and target_price >= float(best_bid) - 0.005),
+                        -float(queue_shares or 0.0),
+                        -asset_priority.get(symbol, len(asset_priority)),
+                    )
+                    new_entry_candidates.append(
+                        (rank, symbol, market_state, market_state['favored_token_id'], target_price)
+                    )
                 elif not market_state.get('last_order_id') and not market_state.get('entered'):
                     market_state['favored_side'] = None
                     market_state['favored_token_id'] = None
+
+            for _rank, _symbol, _state, _token_id, _target_price in sorted(
+                new_entry_candidates, key=lambda candidate: candidate[0], reverse=True
+            ):
+                _place_fresh_bid(_state, _token_id, _target_price)
 
             draw_dashboard(market_states, market_books, time_left)
             time.sleep(1.0)
@@ -2467,6 +2595,29 @@ def main():
             settle_cancel(symbol, market_state, outcome, status)
         print(colored("\nStopped by user.", "yellow"))
         draw_scoreboard(market_states)
+    except Exception as exc:
+        log_event(f"Fatal main-loop error: {type(exc).__name__}: {exc}; canceling open orders", "red")
+        pending = {
+            executor.submit(
+                _cancel_and_confirm,
+                state['favored_token_id'],
+                state['last_order_id'],
+                0.15,
+                state.get('exposure_key'),
+            ): (symbol, state)
+            for symbol, state in market_states.items()
+            if state.get('last_order_id') and state.get('favored_token_id')
+        }
+        for future in as_completed(pending):
+            symbol, state = pending[future]
+            try:
+                outcome, status = future.result()
+            except Exception as cancel_exc:
+                outcome, status = "FAILED", None
+                log_event(f"{symbol} fatal-error cancel failed: {type(cancel_exc).__name__}", "red")
+            settle_cancel(symbol, state, outcome, status)
+        draw_scoreboard(market_states)
+        raise
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
         if DASHBOARD_RENDERED:
