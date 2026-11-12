@@ -777,6 +777,7 @@ def new_market_state(market_ts, market_info):
 
 def _simulate_paper_fills(market_states, market_books):
     """Paper-fill resting bids when live asks trade through their limit price."""
+    global SESSION_ENTRIES
     if not DRY_RUN:
         return
     for symbol, state in market_states.items():
