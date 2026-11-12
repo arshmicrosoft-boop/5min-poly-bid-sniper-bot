@@ -127,11 +127,40 @@ SPINNER_FRAMES = itertools.cycle(["o", "O", "0", "."])
 ROCKET_FRAMES = itertools.cycle(["^   ", " ^  ", "  ^ ", "   ^", "  ^ ", " ^  "])
 
 EVENT_LOG = deque(maxlen=6)
+ORDER_LOG = deque(maxlen=5)
+_SESSION_LOG_LOCK = threading.Lock()
+_THREAD_LOCAL = threading.local()
+
+
+def _http_session():
+    """Return a keep-alive HTTP session scoped to the current worker thread."""
+    session = getattr(_THREAD_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        _THREAD_LOCAL.session = session
+    return session
 
 
 def log_event(msg, color="white"):
     ts = datetime.now().strftime("%H:%M:%S")
     EVENT_LOG.append((ts, msg, color))
+    order_event = any(
+        marker in msg.lower()
+        for marker in ("dry run:", "resting", "order live", "matched", "crossed", "cancel")
+    )
+    if order_event:
+        ORDER_LOG.append((ts, msg, color))
+        try:
+            with _SESSION_LOG_LOCK:
+                with open(
+                    os.path.join(PROJECT_ROOT, "sniper_session.log"),
+                    "a",
+                    encoding="utf-8",
+                ) as fp:
+                    fp.write(f"{datetime.now().isoformat(timespec='seconds')}  {msg}\n")
+        except OSError:
+            # Session logging must never interrupt order management.
+            pass
 
 
 # ============================================================================
@@ -337,7 +366,7 @@ def get_time_remaining(market_ts):
 
 
 def get_order_book(token_id):
-    response = requests.get(
+    response = _http_session().get(
         "https://clob.polymarket.com/book",
         params={'token_id': token_id},
         timeout=10,
@@ -361,7 +390,7 @@ def get_market_info(market_ts, symbol):
     market_slug = f"{prefix}-updown-5m-{market_ts}"
     for attempt in range(2):
         try:
-            response = requests.get(
+            response = _http_session().get(
                 "https://gamma-api.polymarket.com/markets",
                 params={'slug': market_slug, 'closed': 'false', 'active': 'true'},
                 timeout=8,
@@ -414,7 +443,7 @@ def position_shares_for_token(token_id):
     if not user_address:
         return None
     try:
-        resp = requests.get(
+        resp = _http_session().get(
             "https://data-api.polymarket.com/positions",
             params={'user': user_address, 'limit': 500, 'sortBy': 'CURRENT', 'sortDirection': 'DESC'},
             timeout=8,
@@ -593,8 +622,15 @@ def draw_dashboard(market_states, market_books, time_left):
         rows.append(f"{symbol:<6} {quote(up_book):<15} {quote(down_book):<15} {side} / {order}")
     rows.extend([
         f"Session: {SESSION_ENTRIES} fills   {SESSION_ATTEMPTS} order attempts   {SESSION_SKIPS} no-signal checks",
-        "Recent events:",
+        "Recent order actions:",
     ])
+    if ORDER_LOG:
+        rows.extend(f"{ts}  {msg}" for ts, msg, _ in ORDER_LOG)
+    else:
+        rows.append("No order actions yet.")
+    rows.append(
+        "Recent events:",
+    )
     if EVENT_LOG:
         rows.extend(f"{ts}  {msg}" for ts, msg, _ in EVENT_LOG)
     else:
@@ -1038,7 +1074,7 @@ def main():
                     _place_fresh_bid(market_state, market_state['favored_token_id'], target_price)
 
             draw_dashboard(market_states, market_books, time_left)
-            time.sleep(1.0)
+            time.sleep(1.0 if time_left <= ENTRY_WINDOW_SEC + 10 else 3.0)
 
     except KeyboardInterrupt:
         pending = {

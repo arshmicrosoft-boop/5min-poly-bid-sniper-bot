@@ -5,3 +5,4 @@ __pycache__/
 *.py[cod]
 data/
 results/
+sniper_session.log
