@@ -31,6 +31,7 @@ import random
 import itertools
 import json
 import threading
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 import requests
@@ -74,14 +75,14 @@ SIGNATURE_TYPE = 1 if ACCOUNT_SUFFIX == "" else 2
 # ============================================================================
 # STRATEGY CONFIGURATION
 # ============================================================================
-BET_SIZE_USD = 1.0
-ENTRY_THRESHOLD = 0.95
-MAX_BUY_PRICE = 0.95
+BET_SIZE_USD = float(os.getenv("BET_SIZE_USD", "1.0"))
+ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.95"))
+MAX_BUY_PRICE = float(os.getenv("MAX_BUY_PRICE", "0.95"))
 MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "10.0"))
-ENTRY_WINDOW_SEC = 60
-STOP_THRESHOLD_SEC = 5
-ORDER_UPDATE_INTERVAL = 3
-PRICE_HOLD_TOLERANCE = 0.005
+ENTRY_WINDOW_SEC = int(os.getenv("ENTRY_WINDOW_SEC", "60"))
+STOP_THRESHOLD_SEC = int(os.getenv("STOP_THRESHOLD_SEC", "5"))
+ORDER_UPDATE_INTERVAL = int(os.getenv("ORDER_UPDATE_INTERVAL", "3"))
+PRICE_HOLD_TOLERANCE = float(os.getenv("PRICE_HOLD_TOLERANCE", "0.005"))
 
 MARKET_DURATION = 300
 ET = timezone(timedelta(hours=-5))
@@ -97,6 +98,11 @@ TARGET_GAIN_PCT = (1.0 / MAX_BUY_PRICE - 1.0) * 100.0
 SESSION_ENTRIES = 0
 SESSION_SKIPS = 0
 SESSION_ATTEMPTS = 0
+SESSION_WINDOWS = 0
+SESSION_SIGNALS = 0
+SESSION_REPRICES = 0
+SESSION_CUTOFF_CANCELS = 0
+SESSION_TIMEOUTS = 0
 SESSION_START = time.time()
 
 # ============================================================================
@@ -130,6 +136,8 @@ EVENT_LOG = deque(maxlen=6)
 ORDER_LOG = deque(maxlen=5)
 _SESSION_LOG_LOCK = threading.Lock()
 _THREAD_LOCAL = threading.local()
+_PING_LOCK = threading.Lock()
+CLOB_PING_MS = deque(maxlen=30)
 
 
 def _http_session():
@@ -143,10 +151,12 @@ def _http_session():
 
 def log_event(msg, color="white"):
     ts = datetime.now().strftime("%H:%M:%S")
-    EVENT_LOG.append((ts, msg, color))
     order_event = any(
         marker in msg.lower()
-        for marker in ("dry run:", "resting", "order live", "matched", "crossed", "cancel")
+        for marker in (
+            "dry run:", "resting", "order live", "matched", "crossed", "cancel",
+            "exposure cap", "skipping bid",
+        )
     )
     if order_event:
         ORDER_LOG.append((ts, msg, color))
@@ -161,6 +171,8 @@ def log_event(msg, color="white"):
         except OSError:
             # Session logging must never interrupt order management.
             pass
+    else:
+        EVENT_LOG.append((ts, msg, color))
 
 
 # ============================================================================
@@ -504,7 +516,7 @@ def _current_exposure_usd():
 
 
 def _place_fresh_bid(state, token_id, target_price):
-    global SESSION_ATTEMPTS
+    global SESSION_ATTEMPTS, SESSION_TIMEOUTS
     shares = calculate_shares(BET_SIZE_USD, target_price)
     if shares <= 0:
         return
@@ -527,6 +539,7 @@ def _place_fresh_bid(state, token_id, target_price):
             state['exposure_key'] = str(oid)
             OPEN_ORDER_COSTS[str(oid)] = order_cost
         elif oid == 'timeout-assumed-live':
+            SESSION_TIMEOUTS += 1
             state['last_order_id'] = 'timeout-assumed-live'
             state['last_order_price'] = target_price
             state['open_order_price'] = target_price
@@ -545,6 +558,9 @@ def new_market_state(market_ts, market_info):
         'favored_token_id': None,
         'entered': False,
         'entry_fill_price': None,
+        'filled_shares': 0.0,
+        'filled_cost': 0.0,
+        'signal_counted': False,
         'last_order_id': None,
         'exposure_key': None,
         'last_order_price': None,
@@ -580,7 +596,7 @@ def _validate_configuration():
 
 
 def _draw_panel(title, rows, color="cyan"):
-    width = 78
+    width = max(60, min(120, shutil.get_terminal_size((120, 24)).columns))
     print(colored("+" + "-" * (width - 2) + "+", color))
     print(colored("| " + title[:width - 4].ljust(width - 4) + " |", color, attrs=["bold"]))
     print(colored("+" + "-" * (width - 2) + "+", color))
@@ -591,54 +607,143 @@ def _draw_panel(title, rows, color="cyan"):
 
 
 def draw_dashboard(market_states, market_books, time_left):
-    """Render all discovered coin markets together in one compact dashboard."""
+    """Render the live market, risk, execution, and session telemetry dashboard."""
     if not sys.stdout.isatty():
         return
 
     elapsed = max(0, int(time.time() - SESSION_START))
     left = max(0, int(time_left)) if time_left is not None else MARKET_DURATION
     runtime = f"{elapsed // 3600:02d}:{(elapsed // 60) % 60:02d}:{elapsed % 60:02d}"
+    market_ts = next(iter(market_states.values())).get('market_ts') if market_states else get_current_market_timestamp()
+    window_start = datetime.fromtimestamp(market_ts, ET).strftime("%H:%M:%S")
+    window_end = datetime.fromtimestamp(market_ts + MARKET_DURATION, ET).strftime("%H:%M:%S")
+    if left <= STOP_THRESHOLD_SEC:
+        phase, poll_interval = "CUTOFF - STANDING DOWN", 1.0
+    elif left <= ENTRY_WINDOW_SEC:
+        phase, poll_interval = "SNIPE WINDOW ACTIVE", 1.0
+    elif left <= ENTRY_WINDOW_SEC + 10:
+        phase, poll_interval = "PREPARING FAST POLL", 1.0
+    else:
+        phase, poll_interval = "WAITING FOR FINAL 60s", 3.0
+    progress = int(max(0, min(24, round((MARKET_DURATION - left) / MARKET_DURATION * 24))))
+    timer_bar = "#" * progress + "." * (24 - progress)
+    account = ACCOUNT_SUFFIX.lstrip("_") or "default"
+    address = os.getenv(PUBLIC_KEY_ENV_NAME, "")
+    short_address = f"{address[:6]}..{address[-4:]}" if len(address) >= 12 else "unavailable"
+    mode = "DRY RUN" if DRY_RUN else "LIVE MAKER"
+    with _PING_LOCK:
+        ping = sum(CLOB_PING_MS) / len(CLOB_PING_MS) if CLOB_PING_MS else None
+    ping_text = f"{ping:.0f}ms ({'OK' if ping < 500 else 'SLOW'})" if ping is not None else "-- (waiting)"
+
+    # Reservations include unfilled bids and filled shares. This split is for
+    # display only; the exposure cap uses the same underlying reservation ledger.
+    open_bid_cost = 0.0
+    open_bid_shares = 0.0
+    filled_cost = sum(float(s.get('filled_cost') or 0.0) for s in market_states.values())
+    filled_shares = sum(float(s.get('filled_shares') or 0.0) for s in market_states.values())
+    for state in market_states.values():
+        order_id = state.get('last_order_id')
+        exposure_key = str(state.get('exposure_key') or order_id or '')
+        reserved = OPEN_ORDER_COSTS.get(exposure_key, 0.0)
+        if order_id and reserved:
+            open_bid_cost += max(0.0, reserved - float(state.get('filled_cost') or 0.0))
+            order_price = float(state.get('last_order_price') or 0.0)
+            if order_price > 0:
+                open_bid_shares += max(0.0, reserved - float(state.get('filled_cost') or 0.0)) / order_price
+    total_exposure = _current_exposure_usd()
+    other_reserved = max(0.0, total_exposure - open_bid_cost - filled_cost)
+    exposure_ratio = min(1.0, total_exposure / MAX_TOTAL_EXPOSURE_USD) if MAX_TOTAL_EXPOSURE_USD > 0 else 1.0
+    exposure_bar = "#" * round(exposure_ratio * 20) + "." * (20 - round(exposure_ratio * 20))
     rows = [
-        f"Mode: {'DRY RUN (no orders sent)' if DRY_RUN else 'LIVE ORDERS'}   |   Coins: {len(market_states)}/{len(CRYPTO_ASSETS)}   |   Runtime {runtime}",
-        f"Final {ENTRY_WINDOW_SEC}s only | ask >= ${ENTRY_THRESHOLD:.2f} | post-only bid <= ${MAX_BUY_PRICE:.2f} | {left:3d}s left",
-        "SYMBOL  UP bid/ask       DOWN bid/ask     SIGNAL / ORDER",
+        f"POLYMARKET 5M 95c BID SNIPER v1.1 | ACCT: {account} ({short_address}) | MODE: {mode}",
+        f"UPTIME: {runtime} | POLL: {poll_interval:.1f}s ({'FAST' if poll_interval == 1.0 else 'SLOW'}) | CLOB PING: {ping_text} | LOG: sniper_session.log",
+        "=" * 100,
+        f"WINDOW: {window_start} -> {window_end} ET (id: {market_ts}) | PHASE: {phase}",
+        f"TIMER: [{timer_bar}] {left:03d}s left (Entry <= {ENTRY_WINDOW_SEC}s | Hard Cutoff @ {STOP_THRESHOLD_SEC:02d}s)",
+        "-" * 100,
+        "CAPITAL & RISK METRICS",
+        f"USDC Balance: unavailable | Window Exposure: ${total_exposure:.2f} / ${MAX_TOTAL_EXPOSURE_USD:.2f} [{exposure_bar}]",
+        f"Open Bids: {open_bid_shares:.2f}sh (${open_bid_cost:.2f}) | Filled Holding: {filled_shares:.2f}sh (${filled_cost:.2f}) | Other Reserved: ${other_reserved:.2f}",
+        f"Est Payout: ${filled_shares:.2f} if all current filled shares resolve to $1 | Resolved PnL / win rate: unavailable (settlements not tracked)",
+        "=" * 100,
+        "MULTI-CRYPTO SCANNER & EXECUTION MATRIX",
+        "ASSET | UP (BID / ASK) | DOWN (BID / ASK) | FAVORED / 95c GAP | EXECUTION STATUS",
+        "-" * 100,
     ]
     for symbol in CRYPTO_ASSETS:
         market_state = market_states.get(symbol)
         if not market_state:
-            rows.append(f"{symbol:<6} market unavailable in this window")
+            rows.append(f"{symbol:<5} | --- / ---       | --- / ---         | unavailable       | market discovery pending")
             continue
         up_book, down_book = market_books.get(symbol, (None, None))
-        def price(value):
-            return f"{value:.3f}" if value is not None else "---"
         def quote(book):
-            return f"{price(book.get('best_bid'))}/{price(book.get('best_ask'))}" if book else "---/---"
-        side = market_state.get('favored_side') or "watching"
-        if market_state.get('last_order_id'):
-            kind = "SIM" if DRY_RUN else "LIVE"
-            order = f"{kind} {side} @ {market_state.get('last_order_price') or 0:.3f}"
+            if not book:
+                return "---", "---"
+            bid, ask = book.get('best_bid'), book.get('best_ask')
+            return f"{bid:.3f}" if bid is not None else "---", f"{ask:.3f}" if ask is not None else "---"
+        up_bid, up_ask = quote(up_book)
+        down_bid, down_ask = quote(down_book)
+        available_asks = [(up_book or {}).get('best_ask'), (down_book or {}).get('best_ask')]
+        sides = [("UP", available_asks[0]), ("DOWN", available_asks[1])]
+        leading_side, leading_ask = max(
+            ((side, ask) for side, ask in sides if ask is not None),
+            key=lambda pair: pair[1], default=(None, None),
+        )
+        decided = leading_ask is not None and leading_ask >= ENTRY_THRESHOLD
+        if decided:
+            gap_text = f"{leading_side} [DECIDED +{(leading_ask - ENTRY_THRESHOLD) * 100:.0f}c]"
+        elif leading_ask is not None:
+            gap_text = f"{leading_side} ({(ENTRY_THRESHOLD - leading_ask) * 100:.1f}c away)"
         else:
-            order = "no order"
-        rows.append(f"{symbol:<6} {quote(up_book):<15} {quote(down_book):<15} {side} / {order}")
+            gap_text = "no asks / unavailable"
+
+        if market_state.get('entered'):
+            status_text = f"HOLD {market_state.get('filled_shares', 0):.2f}sh @ ${market_state.get('entry_fill_price') or 0:.3f}"
+        elif market_state.get('last_order_id'):
+            kind = "SIM BID" if DRY_RUN else "LIVE BID"
+            status_text = f"{kind} {market_state.get('last_order_price') or 0:.3f}"
+        else:
+            status_text = "WATCHING"
+            if decided:
+                try:
+                    price = compute_bid_target(up_book if leading_side == "UP" else down_book)
+                    shares = calculate_shares(BET_SIZE_USD, price) if price else 0.0
+                    order_cost = price * shares if price else 0.0
+                    if total_exposure + order_cost > MAX_TOTAL_EXPOSURE_USD:
+                        status_text = f"CAPPED (${total_exposure:.2f}/${MAX_TOTAL_EXPOSURE_USD:.2f})"
+                    elif price:
+                        status_text = f"SIGNAL / BID {price:.3f}"
+                except (TypeError, ValueError):
+                    pass
+            elif leading_ask is None:
+                status_text = "NO BOOK / UNDECIDED"
+            elif leading_ask < ENTRY_THRESHOLD:
+                status_text = "CHOP / UNDECIDED"
+        rows.append(
+            f"{symbol:<5} | {up_bid} / {up_ask}       | {down_bid} / {down_ask}         | {gap_text:<19} | {status_text}"
+        )
+    fill_rate = (SESSION_ENTRIES / SESSION_SIGNALS * 100.0) if SESSION_SIGNALS else 0.0
     rows.extend([
-        f"Session: {SESSION_ENTRIES} fills   {SESSION_ATTEMPTS} order attempts   {SESSION_SKIPS} no-signal checks",
-        "Recent order actions:",
+        "=" * 100,
+        "SESSION TELEMETRY",
+        f"Windows Seen: {SESSION_WINDOWS:<4} Signals (>=95c): {SESSION_SIGNALS:<4} Order Attempts: {SESSION_ATTEMPTS:<4} Reprices: {SESSION_REPRICES}",
+        f"Fills: {SESSION_ENTRIES:<4} Fill Rate: {fill_rate:5.1f}% Cutoff Cancels: {SESSION_CUTOFF_CANCELS:<4} Timeouts: {SESSION_TIMEOUTS}",
+        "-" * 100,
+        "ORDER & EXECUTION LOG (persistent in sniper_session.log; last 5 shown)",
     ])
     if ORDER_LOG:
         rows.extend(f"{ts}  {msg}" for ts, msg, _ in ORDER_LOG)
     else:
         rows.append("No order actions yet.")
-    rows.append(
-        "Recent events:",
-    )
+    rows.extend(["-" * 100, "SYSTEM & DISCOVERY LOG"])
     if EVENT_LOG:
         rows.extend(f"{ts}  {msg}" for ts, msg, _ in EVENT_LOG)
     else:
         rows.append("Starting up; waiting for market data.")
 
     print("\033[2J\033[H", end="")
-    _draw_panel("POLYMARKET MULTI-CRYPTO 5-MINUTE BID SNIPER", rows)
-    footer = "Dry-run order state is in memory only; Ctrl+C clears it." if DRY_RUN else "Ctrl+C stops the bot. Check for any remaining live orders."
+    _draw_panel("POLYMARKET 5-MINUTE BID SNIPER", rows)
+    footer = "[Ctrl+C] Safe shutdown: cancel live bids in parallel before exit" if not DRY_RUN else "[Ctrl+C] Safe shutdown: clear simulated bids; dry-run state is memory only"
     color = "yellow" if left <= ENTRY_WINDOW_SEC else "green"
     print(colored(footer, color))
 
@@ -734,6 +839,9 @@ def _record_fill(symbol, market_state, fill_status, preserve_open_order=False):
     exposure_key = str(market_state.get('exposure_key') or market_state.get('last_order_id') or '')
     if matched > 0 and price > 0 and exposure_key and not preserve_open_order:
         OPEN_ORDER_COSTS[exposure_key] = matched * price
+    if matched > market_state.get('filled_shares', 0.0):
+        market_state['filled_shares'] = matched
+        market_state['filled_cost'] = matched * price
     if not market_state.get('entered'):
         SESSION_ENTRIES += 1
     market_state['entered'] = True
@@ -742,15 +850,21 @@ def _record_fill(symbol, market_state, fill_status, preserve_open_order=False):
 
 
 def _poll_book(token_id, side_label):
+    started = time.perf_counter()
     try:
         return get_order_book(token_id)
     except Exception as exc:
         log_event(f"{side_label} book request failed: {type(exc).__name__}", "yellow")
         return None
+    finally:
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        with _PING_LOCK:
+            CLOB_PING_MS.append(elapsed_ms)
 
 
 def main():
-    global SESSION_SKIPS, SESSION_ENTRIES
+    global SESSION_SKIPS, SESSION_ENTRIES, SESSION_WINDOWS, SESSION_SIGNALS
+    global SESSION_REPRICES, SESSION_CUTOFF_CANCELS
     _validate_configuration()
     market_states = {}
     market_books = {}
@@ -786,6 +900,7 @@ def main():
             market_ts = get_current_market_timestamp()
 
             if market_ts != current_market_ts:
+                SESSION_WINDOWS += 1
                 previous_states = market_states
                 cancel_futures = {
                     executor.submit(
@@ -901,6 +1016,8 @@ def main():
                     except Exception as exc:
                         outcome, status = "FAILED", None
                         log_event(f"{symbol} cutoff cancel failed: {type(exc).__name__}", "red")
+                    if outcome == "CANCELED":
+                        SESSION_CUTOFF_CANCELS += 1
                     settle_cancel(symbol, market_state, outcome, status)
                 draw_dashboard(market_states, market_books, time_left)
                 time.sleep(1.0)
@@ -1050,6 +1167,7 @@ def main():
                                 _clear_order_state(market_state)
                             elif outcome == "CANCELED":
                                 _clear_order_state(market_state)
+                                SESSION_REPRICES += 1
                                 _place_fresh_bid(market_state, market_state['favored_token_id'], target_price)
                             continue
                         continue
@@ -1063,6 +1181,9 @@ def main():
                     if side is None:
                         SESSION_SKIPS += 1
                         continue
+                    if not market_state.get('signal_counted'):
+                        SESSION_SIGNALS += 1
+                        market_state['signal_counted'] = True
                     market_state['favored_side'] = side
                     token_key = 'up_token_id' if side == "UP" else 'down_token_id'
                     market_state['favored_token_id'] = market_state['market_info'][token_key]

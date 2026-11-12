@@ -93,7 +93,8 @@ def wilson_interval(wins, total, z=1.959963984540054):
 
 def run_backtest(path, latency_ms=DEFAULT_LATENCY_MS, slip_multiplier=1.0,
                  fee_rate=0.0, fill_rate=1.0, seed=41, bankroll=10.0, days=14,
-                 threshold=DEFAULT_THRESHOLD, cap=DEFAULT_CAP, dataset=None):
+                 threshold=DEFAULT_THRESHOLD, cap=DEFAULT_CAP, dataset=None,
+                  extra_cost_per_share=0.0):
     markets = dataset if dataset is not None else load_dataset(path)
     dated = [v["meta"].get("start_ms", 0) for v in markets.values() if v["meta"].get("start_ms")]
     if dated and days:
@@ -416,7 +417,7 @@ def run_backtest(path, latency_ms=DEFAULT_LATENCY_MS, slip_multiplier=1.0,
         start_btc, end_btc = binance_window_prices(entry)
         slippage = max(0.001, (latency_ms / 1000.0) * 0.0045) * slip_multiplier
         fee = fee_per_share(trade["price"], fee_rate)
-        cost = trade["shares"] * (trade["price"] + fee + slippage)
+        cost = trade["shares"] * (trade["price"] + fee + slippage + extra_cost_per_share)
         payout = trade["shares"] * (1.0 if won else 0.0)
         if cost > cash:
             capital_skips += 1

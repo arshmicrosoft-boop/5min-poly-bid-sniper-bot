@@ -181,9 +181,30 @@ def run_all(args):
     show("FILL-RATE STRESS (50% fills)", fill50_m)
 
     print("--- THRESHOLD PLATEAU (maker fee=0) ---")
-    print(f"{'price':>6} {'trades':>7} {'wins':>6} {'WR':>7} {'netPnL':>10} {'maxDD':>8}")
+    print(f"{'price':>6} {'trades':>7} {'wins':>6} {'WR':>7} {'fillRate':>9} {'netPnL':>10} {'maxDD':>8}")
     for p, m in sweep:
-        print(f"{p:>6.2f} {m['n']:>7d} {m['wins']:>6d} {m['wr']:>6.2%} ${m['net_pnl']:>8.2f} ${m['max_dd']:>6.2f}")
+        fr = "n/a" if m.get('fill_rate') is None else f"{m['fill_rate']:.0%}"
+        print(f"{p:>6.2f} {m['n']:>7d} {m['wins']:>6d} {m['wr']:>6.2%} {fr:>9} ${m['net_pnl']:>8.2f} ${m['max_dd']:>6.2f}")
+    print()
+
+    # Conservative cost stress: +0.5c and +1.0c effective entry cost per share
+    print("--- COST STRESS SWEEP (+0.5c / +1.0c per share) ---")
+    print(f"{'price':>6} {'netPnL@0c':>11} {'netPnL@+0.5c':>13} {'netPnL@+1.0c':>13} {'pos@+1.0c':>10}")
+    for p, _ in sweep:
+        tr0 = bt.run_backtest(data_path, args.latency_ms, 1.0, 0.0, 1.0, args.seed,
+                              days=args.days, threshold=p, cap=p, dataset=dataset,
+                              extra_cost_per_share=0.0)
+        tr5 = bt.run_backtest(data_path, args.latency_ms, 1.0, 0.0, 1.0, args.seed,
+                              days=args.days, threshold=p, cap=p, dataset=dataset,
+                              extra_cost_per_share=0.005)
+        tr10 = bt.run_backtest(data_path, args.latency_ms, 1.0, 0.0, 1.0, args.seed,
+                               days=args.days, threshold=p, cap=p, dataset=dataset,
+                               extra_cost_per_share=0.010)
+        m0 = summarize_extra(tr0, next((x for x in tr0 if "_bankroll_end" in x), {}))
+        m5 = summarize_extra(tr5, next((x for x in tr5 if "_bankroll_end" in x), {}))
+        m10 = summarize_extra(tr10, next((x for x in tr10 if "_bankroll_end" in x), {}))
+        pos = "YES" if m10['net_pnl'] > 0 else "NO"
+        print(f"{p:>6.2f} ${m0['net_pnl']:>9.2f} ${m5['net_pnl']:>11.2f} ${m10['net_pnl']:>11.2f} {pos:>10}")
     print()
 
     # ---- GATES ----
