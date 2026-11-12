@@ -136,6 +136,7 @@ HYPE_MESSAGES = [
 
 SPINNER_FRAMES = itertools.cycle(["o", "O", "0", "."])
 _DASHBOARD_FRAME = itertools.count()
+DASHBOARD_RENDERED = False
 ROCKET_FRAMES = itertools.cycle(["^   ", " ^  ", "  ^ ", "   ^", "  ^ ", " ^  "])
 
 EVENT_LOG = deque(maxlen=6)
@@ -604,9 +605,11 @@ def _validate_configuration():
 def _draw_panel(title, rows, color="cyan"):
     width = max(60, min(120, shutil.get_terminal_size((120, 24)).columns))
     frame = next(_DASHBOARD_FRAME)
-    print(colored("+" + "-" * (width - 2) + "+", color))
-    print(colored("| " + title[:width - 4].ljust(width - 4) + " |", color, attrs=["bold"]))
-    print(colored("+" + "-" * (width - 2) + "+", color))
+    lines = [
+        colored("+" + "-" * (width - 2) + "+", color),
+        colored("| " + title[:width - 4].ljust(width - 4) + " |", color, attrs=["bold"]),
+        colored("+" + "-" * (width - 2) + "+", color),
+    ]
     for row in rows:
         # Keep the display inside the frame and avoid terminal wrapping.
         clipped = row[:width - 4].ljust(width - 4)
@@ -629,14 +632,16 @@ def _draw_panel(title, rows, color="cyan"):
         elif row.startswith(("=", "-")):
             row_color = "cyan"
         if row_color:
-            print(colored("| " + clipped + " |", row_color, attrs=attrs))
+            lines.append(colored("| " + clipped + " |", row_color, attrs=attrs))
         else:
-            print("| " + clipped + " |")
-    print(colored("+" + "-" * (width - 2) + "+", color))
+            lines.append("| " + clipped + " |")
+    lines.append(colored("+" + "-" * (width - 2) + "+", color))
+    return "\n".join(lines)
 
 
 def draw_dashboard(market_states, market_books, time_left):
     """Render the live market, risk, execution, and session telemetry dashboard."""
+    global DASHBOARD_RENDERED
     if not sys.stdout.isatty():
         return
 
@@ -772,11 +777,17 @@ def draw_dashboard(market_states, market_books, time_left):
     else:
         rows.append("Starting up; waiting for market data.")
 
-    print("\033[2J\033[H", end="")
-    _draw_panel("POLYMARKET 5-MINUTE BID SNIPER", rows)
     footer = "[Ctrl+C] Safe shutdown: cancel live bids in parallel before exit" if not DRY_RUN else "[Ctrl+C] Safe shutdown: clear simulated bids; dry-run state is memory only"
     color = "yellow" if left <= ENTRY_WINDOW_SEC else "green"
-    print(colored(footer, color))
+    frame_text = _draw_panel("POLYMARKET 5-MINUTE BID SNIPER", rows)
+    frame_text += "\n" + colored(footer, color)
+    if DASHBOARD_RENDERED:
+        sys.stdout.write("\033[H" + frame_text + "\033[J")
+    else:
+        # Clear once on startup; later frames overwrite the same terminal area.
+        sys.stdout.write("\033[2J\033[H\033[?25l" + frame_text + "\033[J")
+        DASHBOARD_RENDERED = True
+    sys.stdout.flush()
 
 
 def draw_scoreboard(market_states):
@@ -902,6 +913,7 @@ def main():
     executor = ThreadPoolExecutor(max_workers=BOOK_WORKERS, thread_name_prefix="market-data")
     current_market_ts = None
     next_discovery_at = 0.0
+    next_book_poll_at = 0.0
     log_event(
         "Multi-crypto bot started in DRY RUN; no account orders will be sent" if DRY_RUN
         else "Multi-crypto bot started in LIVE ORDER mode",
@@ -1021,6 +1033,7 @@ def main():
                 current_market_ts = market_ts
                 market_states = {}
                 market_books = {}
+                next_book_poll_at = 0.0
                 log_event(f"New multi-crypto market window {market_ts}", "cyan")
                 futures = {
                     executor.submit(get_market_info, market_ts, symbol): symbol
@@ -1093,22 +1106,28 @@ def main():
                 time.sleep(1.0)
                 continue
 
-            # Poll all discovered books concurrently. A book may validly have
-            # only bids or only asks; each outcome is evaluated independently.
-            book_futures = {}
-            for symbol, market_state in market_states.items():
-                info = market_state['market_info']
-                book_futures[executor.submit(_poll_book, info['up_token_id'], f"{symbol} UP")] = (symbol, "UP")
-                book_futures[executor.submit(_poll_book, info['down_token_id'], f"{symbol} DOWN")] = (symbol, "DOWN")
-            fresh_books = {symbol: {"UP": None, "DOWN": None} for symbol in market_states}
-            for future in as_completed(book_futures):
-                symbol, side = book_futures[future]
-                try:
-                    fresh_books[symbol][side] = future.result()
-                except Exception as exc:
-                    log_event(f"{symbol} {side} book poll failed: {type(exc).__name__}", "yellow")
-            for symbol, books in fresh_books.items():
-                market_books[symbol] = (books["UP"], books["DOWN"])
+            # Keep the terminal refreshing every second while pacing network
+            # polls at 3s outside the entry window and 1s near/inside it.
+            time_left = get_time_remaining(market_ts)
+            book_poll_interval = 1.0 if time_left <= ENTRY_WINDOW_SEC + 10 else 3.0
+            if time.monotonic() >= next_book_poll_at:
+                # A book may validly have only bids or only asks; evaluate each
+                # outcome independently and keep the previous frame between polls.
+                book_futures = {}
+                for symbol, market_state in market_states.items():
+                    info = market_state['market_info']
+                    book_futures[executor.submit(_poll_book, info['up_token_id'], f"{symbol} UP")] = (symbol, "UP")
+                    book_futures[executor.submit(_poll_book, info['down_token_id'], f"{symbol} DOWN")] = (symbol, "DOWN")
+                fresh_books = {symbol: {"UP": None, "DOWN": None} for symbol in market_states}
+                for future in as_completed(book_futures):
+                    symbol, side = book_futures[future]
+                    try:
+                        fresh_books[symbol][side] = future.result()
+                    except Exception as exc:
+                        log_event(f"{symbol} {side} book poll failed: {type(exc).__name__}", "yellow")
+                for symbol, books in fresh_books.items():
+                    market_books[symbol] = (books["UP"], books["DOWN"])
+                next_book_poll_at = time.monotonic() + book_poll_interval
 
             now = time.time()
             time_left = get_time_remaining(market_ts)
@@ -1265,7 +1284,7 @@ def main():
                     _place_fresh_bid(market_state, market_state['favored_token_id'], target_price)
 
             draw_dashboard(market_states, market_books, time_left)
-            time.sleep(1.0 if time_left <= ENTRY_WINDOW_SEC + 10 else 3.0)
+            time.sleep(1.0)
 
     except KeyboardInterrupt:
         pending = {
@@ -1290,6 +1309,9 @@ def main():
         draw_scoreboard(market_states)
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
+        if DASHBOARD_RENDERED:
+            sys.stdout.write("\033[?25h\n")
+            sys.stdout.flush()
 
 
 if __name__ == "__main__":
