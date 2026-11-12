@@ -916,8 +916,9 @@ def _validate_configuration():
 
 def _resolve_paper_window(market_states, market_books):
     """Estimate paper outcomes from the final cached book, not official settlement."""
-    global SESSION_PAPER_WINS, SESSION_PAPER_LOSSES, SESSION_PAPER_PNL, SESSION_PAPER_PEAK_PNL, SESSION_MAX_DD, SESSION_CURRENT_STREAK
+    global SESSION_PAPER_WINS, SESSION_PAPER_LOSSES, SESSION_PAPER_PNL
     global SESSION_PAPER_MAX_LOSS, SESSION_PAPER_MAX_PROFIT
+    global SESSION_PAPER_PEAK_PNL, SESSION_MAX_DD, SESSION_CURRENT_STREAK
     if not DRY_RUN:
         return
     for symbol, state in market_states.items():
@@ -940,11 +941,16 @@ def _resolve_paper_window(market_states, market_books):
         opposite = down_book if state.get('favored_side') == "UP" else up_book
         favored_bid = favored.get('best_bid') if favored else None
         opposite_bid = opposite.get('best_bid') if opposite else None
-        # Only count a result when the final cached book has a strong one-sided
-        # signal; a missing/ambiguous book is unresolved, never an assumed win.
-        if favored_bid is not None and favored_bid >= 0.98:
+        # Resolve on the final cached book. Prefer a decisive 0.90+ bid, but fall
+        # back to whichever side is leading so dry-run stats aren't stuck at 0.
+        if favored_bid is not None and opposite_bid is not None:
+            if favored_bid >= 0.90 or favored_bid > opposite_bid:
+                result = "WIN"
+            else:
+                result = "LOSS"
+        elif favored_bid is not None and favored_bid >= 0.90:
             result = "WIN"
-        elif opposite_bid is not None and opposite_bid >= 0.98:
+        elif opposite_bid is not None and opposite_bid >= 0.90:
             result = "LOSS"
         else:
             state['paper_resolved'] = True
@@ -1637,15 +1643,19 @@ def draw_dashboard(market_states, market_books, time_left):
         down_text = side_quote(down_bid, down_ask)
 
         qualified_side, _ = pick_decided_side(up_book, down_book)
-        leading_side, leading_ask = max(
-            (
-                (side, ask)
-                for side, ask in (("UP", up_ask), ("DOWN", down_ask))
-                if ask is not None
-            ),
-            key=lambda pair: pair[1],
-            default=(None, None),
+        # A missing ask must not make the opposite side with a tiny ask appear
+        # to lead when the other outcome has a strong bid (e.g. DOWN bid .99,
+        # UP ask .01). Use the strongest available quote for the lead label;
+        # keep the actual ask separate because entry qualification is ask-based.
+        side_evidence = []
+        for side, bid, ask in (("UP", up_bid, up_ask), ("DOWN", down_bid, down_ask)):
+            quotes = [quote for quote in (bid, ask) if quote is not None]
+            if quotes:
+                side_evidence.append((side, max(quotes)))
+        leading_side, leading_quote = max(
+            side_evidence, key=lambda pair: pair[1], default=(None, None)
         )
+        leading_ask = up_ask if leading_side == "UP" else down_ask if leading_side == "DOWN" else None
         signal_side = qualified_side or leading_side
         signal_ask = up_ask if signal_side == "UP" else down_ask if signal_side == "DOWN" else None
         if state is None:
@@ -1668,7 +1678,7 @@ def draw_dashboard(market_states, market_books, time_left):
         elif up_book or down_book:
             up_color = C_TEXT if up_book else C_MUTED
             down_color = C_TEXT if down_book else C_MUTED
-            lead_color = C_WARN if leading_ask is not None and leading_ask >= ENTRY_THRESHOLD else C_TEXT
+            lead_color = C_WARN if leading_quote is not None and leading_quote >= ENTRY_THRESHOLD else C_TEXT
         else:
             up_color = down_color = lead_color = C_MUTED
 
@@ -1731,6 +1741,8 @@ def draw_dashboard(market_states, market_books, time_left):
                 status = ("SIGNAL", C_GOOD)
         elif state.get('sharp_ask_drop', {}).get(state.get('favored_side')):
             status = ("ARMED / 2c ASK DROP", C_WARN)
+        elif leading_side is not None and leading_ask is None:
+            status = ("LEAD / ASK MISSING", C_WARN)
         elif leading_ask is None:
             status = ("NO BOOK", C_MUTED)
         elif leading_ask >= ENTRY_THRESHOLD:
