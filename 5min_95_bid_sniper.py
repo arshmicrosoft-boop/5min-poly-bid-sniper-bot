@@ -795,6 +795,16 @@ def _simulate_paper_fills(market_states, market_books):
         order['status'] = 'MATCHED'
         order['size_matched'] = float(order['size'])
         SESSION_FILL_PRICES.append(float(order['price']))
+        # Propagate the simulated fill into market state so capital/risk and
+        # PnL reflect it immediately (not only at window rollover).
+        state['filled_shares'] = float(order['size'])
+        state['filled_cost'] = float(order['price']) * float(order['size'])
+        if not state.get('entered'):
+            SESSION_ENTRIES += 1
+        state['entered'] = True
+        state['entry_fill_price'] = float(order['price'])
+        # Release the resting reservation; the position is now held.
+        OPEN_ORDER_COSTS.pop(str(order_id), None)
         log_event(
             f"{symbol} DRY RUN PAPER FILL: ask {best_ask:.3f} reached bid {order['price']:.3f}; "
             f"{order['size_matched']:.2f} shares (book-touch model)",
