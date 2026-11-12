@@ -1098,6 +1098,13 @@ def draw_dashboard(market_states, market_books, time_left):
     open_bid_shares = 0.0
     filled_cost = sum(float(s.get('filled_cost') or 0.0) for s in market_states.values())
     filled_shares = sum(float(s.get('filled_shares') or 0.0) for s in market_states.values())
+    # In dry run, resting paper orders are never "filled" by the data API, so
+    # surface their potential exposure as max profit/loss for visibility.
+    if DRY_RUN:
+        for order in PAPER_ORDERS.values():
+            if order.get('status') == 'LIVE':
+                filled_shares += float(order.get('size') or 0.0)
+                filled_cost += float(order.get('price') or 0.0) * float(order.get('size') or 0.0)
     for state in market_states.values():
         order_id = state.get('last_order_id')
         exposure_key = str(state.get('exposure_key') or order_id or '')
