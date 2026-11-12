@@ -796,6 +796,9 @@ def _resolve_paper_window(market_states, market_books):
             state['paper_resolved'] = True
             continue
 
+        entry = float(state.get('last_order_price') or 0.0)
+        if entry <= 0 and shares > 0:
+            entry = cost / shares
         state['paper_resolved'] = True
         if result == "WIN":
             SESSION_PAPER_WINS += 1
