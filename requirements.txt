@@ -1,0 +1,6 @@
+requests
+python-dotenv
+termcolor
+web3
+py-clob-client-v2
+websockets
