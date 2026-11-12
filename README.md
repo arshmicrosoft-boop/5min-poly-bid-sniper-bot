@@ -61,7 +61,7 @@ python .\5min_95_bid_sniper.py
 
 The terminal dashboard shows the active market and timer, both order books, selected side, order state, session counts, and recent events. Press `Ctrl+C` to stop.
 
-**Dry run is the default.** It reads live public market data and keeps simulated open/canceled order state in process memory. It does not connect to your account, place orders, check positions, or simulate fills. The paper order state disappears when the process exits. No `.env` file or credentials are needed for dry run.
+**Dry run is the default.** It reads live public market data and keeps simulated order state in process memory. It does not connect to your account or place orders. A paper order is marked filled when the live best ask reaches or crosses its bid; this book-touch model assumes a full fill and does not model queue priority, available size, or actual trades. At window rollover, paper results use the last cached book and a 98¢ bid threshold as a directional outcome proxy, not official settlement. Paper state disappears when the process exits. No `.env` file or credentials are needed for dry run.
 
 Run the dry mode:
 
@@ -75,12 +75,18 @@ To enable live order submission, set `DRY_RUN=false` in `.env` and configure val
 | --- | ---: |
 | Target bet size | `$1.00` (subject to five-share minimum) |
 | Decided-side ask threshold | `$0.95` |
+| Minimum same-side bid | `$0.88` |
+| Maximum opposite-side bid | `$0.08` |
 | Maximum buy price | `$0.95` |
+| Early-window maximum bid (over 30s left) | `$0.93` |
 | Entry window | Final 60 seconds |
 | Stop/cancel threshold | 5 seconds remaining |
 | Order recheck interval | 3 seconds |
+| Maximum total exposure | `$10.00` |
 
-The bot can place a separate order for each qualifying coin in the same window. At the five-share minimum, five concurrent entries at `$0.95` could require up to `$23.75` before fees. There is no global portfolio exposure cap.
+The bot can place separate orders for qualifying coins in the same window until the `$10.00` exposure cap is reached. At the five-share minimum and `$0.95`, this generally allows two simultaneous bids (`$9.50` total); which signals get the available exposure currently depends on market discovery order.
+
+Signals also require a same-side bid of at least `$0.88` and an opposite-side bid no higher than `$0.08`. A rapid ask drop of 2¢ or more blocks a new bid for that book update. Existing orders bypass the normal recheck delay when the signal fails these validity checks, allowing an immediate stand-down cancellation.
 
 ## Order-state handling
 
