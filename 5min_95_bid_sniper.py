@@ -2104,11 +2104,24 @@ def _poll_books_batch(market_states):
             CLOB_PING_MS.append(elapsed_ms)
 
 
+def reconcile_open_orders():
+    """Cancel any outstanding open orders from a previous run (live mode only)."""
+    if DRY_RUN:
+        return
+    try:
+        client = _build_client()
+        client.cancel_all()
+        log_event("Startup: canceled all pre-existing open orders", "yellow")
+    except Exception as exc:
+        log_event(f"Startup open-order reconciliation failed: {type(exc).__name__}: {exc}", "red")
+
+
 def main():
     global SESSION_SKIPS, SESSION_ENTRIES, SESSION_WINDOWS, SESSION_SIGNALS
     global SESSION_REPRICES, SESSION_CUTOFF_CANCELS
     global SESSION_PAPER_WINS, SESSION_PAPER_LOSSES, SESSION_PAPER_PNL
     _validate_configuration()
+    reconcile_open_orders()
     market_states = {}
     market_books = {}
     executor = ThreadPoolExecutor(max_workers=BOOK_WORKERS, thread_name_prefix="market-data")
