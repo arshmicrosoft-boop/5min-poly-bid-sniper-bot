@@ -85,6 +85,7 @@ TARGET_NOTIONAL_USD = float(os.getenv("TARGET_NOTIONAL_USD", os.getenv("BET_SIZE
 MAX_ORDER_NOTIONAL_USD = float(os.getenv("MAX_ORDER_NOTIONAL_USD", "5.0"))
 DRY_RUN_FEE_RATE = float(os.getenv("DRY_RUN_FEE_RATE", "0.0"))
 DRY_RUN_SLIPPAGE = float(os.getenv("DRY_RUN_SLIPPAGE", "0.001"))
+DRY_RUN_SIM_FILL_RATE = float(os.getenv("DRY_RUN_SIM_FILL_RATE", "0.0"))
 ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.95"))
 MAX_BUY_PRICE = float(os.getenv("MAX_BUY_PRICE", "0.95"))
 MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "5.0"))
@@ -197,7 +198,7 @@ def log_event(msg, color="white"):
         marker in msg.lower()
         for marker in (
             "dry run:", "resting", "order live", "matched", "crossed", "cancel",
-            "paper fill", "paper win", "paper loss", "paper outcome",
+            "paper fill", "paper win", "paper loss", "paper outcome", "critical:",
             "exposure cap", "skipping bid",
         )
     )
@@ -840,7 +841,9 @@ def _simulate_paper_fills(market_states, market_books):
         up_book, down_book = market_books.get(symbol, (None, None))
         book = up_book if side == 'UP' else down_book if side == 'DOWN' else None
         best_ask = book.get('best_ask') if book else None
-        if best_ask is None or best_ask > float(order['price']) + 1e-9:
+        real_fill = best_ask is not None and best_ask <= float(order['price']) + 1e-9
+        sim_fill = (not real_fill) and DRY_RUN_SIM_FILL_RATE > 0 and random.random() < DRY_RUN_SIM_FILL_RATE
+        if not real_fill and not sim_fill:
             continue
         order['status'] = 'MATCHED'
         order['size_matched'] = float(order['size'])
@@ -966,6 +969,11 @@ def _validate_configuration():
         for name in placeholders:
             print(f"  - {name}")
         raise SystemExit(2)
+    raise SystemExit(
+        "Live mode is disabled: this script does not yet track authoritative live "
+        "fills and realized settlement PnL, so its session-loss limit cannot be enforced. "
+        "Keep DRY_RUN=true until live settlement accounting is implemented and verified."
+    )
 
 
 def _resolve_paper_window(market_states, market_books):
@@ -1828,15 +1836,22 @@ def draw_dashboard(market_states, market_books, time_left):
             sum(SESSION_FILL_PRICES) / len(SESSION_FILL_PRICES)
             if SESSION_FILL_PRICES else 0.0
         )
-        be_wr = (avg_fill * (1.0 + DRY_RUN_FEE_RATE) + DRY_RUN_SLIPPAGE) * 100.0
+        if SESSION_PAPER_WINS + SESSION_PAPER_LOSSES > 0:
+            be_wr = (avg_fill * (1.0 + DRY_RUN_FEE_RATE) + DRY_RUN_SLIPPAGE) * 100.0
+            be_text = f"{be_wr:.1f}%"
+            avg_text = f"${avg_fill:.3f}"
+        else:
+            be_text = "--"
+            avg_text = "--"
         result_bits = [
             _kpi("paper", f"{SESSION_PAPER_WINS}W/{SESSION_PAPER_LOSSES}L"),
             _seg("  "),
-            _kpi("wr", f"{win_rate:.0f}%", C_GOOD if win_rate >= 50 else C_TEXT),
+            _kpi("wr", f"{win_rate:.0f}%" if SESSION_PAPER_WINS + SESSION_PAPER_LOSSES > 0 else "--",
+                 C_GOOD if win_rate >= 50 else C_TEXT),
             _seg("  "),
-            _kpi("be", f"{be_wr:.1f}%", C_MUTED),
+            _kpi("be", be_text, C_MUTED),
             _seg("  "),
-            _kpi("avg", f"${avg_fill:.3f}", C_TEXT),
+            _kpi("avg", avg_text, C_TEXT),
             _seg("  "),
             _kpi("pnl", _signed_money(SESSION_PAPER_PNL),
                  C_GOOD if SESSION_PAPER_PNL > 0 else C_BAD if SESSION_PAPER_PNL < 0 else C_TEXT),
@@ -2182,16 +2197,33 @@ def _poll_books_batch(market_states):
             CLOB_PING_MS.append(elapsed_ms)
 
 
-def reconcile_open_orders():
-    """Cancel any outstanding open orders from a previous run (live mode only)."""
+def reconcile_open_orders(market_states):
+    """Fail closed if target markets already have open orders from another run."""
     if DRY_RUN:
-        return
-    try:
-        client = _build_client()
-        client.cancel_all()
-        log_event("Startup: canceled all pre-existing open orders", "yellow")
-    except Exception as exc:
-        log_event(f"Startup open-order reconciliation failed: {type(exc).__name__}: {exc}", "red")
+        return True
+    client = _build_client()
+    open_orders = client.get_open_orders()
+    target_tokens = {
+        str(token)
+        for state in market_states.values()
+        for token in (
+            state['market_info'].get('up_token_id'),
+            state['market_info'].get('down_token_id'),
+        )
+        if token
+    }
+    conflicts = [
+        order for order in open_orders
+        if str(order.get('asset_id') or order.get('token_id') or '') in target_tokens
+    ]
+    if conflicts:
+        tokens = sorted({str(o.get('asset_id') or o.get('token_id') or '') for o in conflicts})
+        raise RuntimeError(
+            f"Startup blocked: {len(conflicts)} open order(s) already exist in current "
+            f"target markets ({', '.join(token[:10] for token in tokens)}). "
+            "Inspect/cancel them manually, then restart. No orders were canceled."
+        )
+    return True
 
 
 def main():
@@ -2199,7 +2231,6 @@ def main():
     global SESSION_REPRICES, SESSION_CUTOFF_CANCELS
     global SESSION_PAPER_WINS, SESSION_PAPER_LOSSES, SESSION_PAPER_PNL
     _validate_configuration()
-    reconcile_open_orders()
     market_states = {}
     market_books = {}
     executor = ThreadPoolExecutor(max_workers=BOOK_WORKERS, thread_name_prefix="market-data")
@@ -2363,6 +2394,7 @@ def main():
                 if not market_states:
                     log_event("No target crypto markets listed yet; will retry", "yellow")
                 if market_states and not DRY_RUN:
+                    reconcile_open_orders(market_states)
                     _reconcile_startup_positions(market_states)
 
             missing = [symbol for symbol in CRYPTO_ASSETS if symbol not in market_states]
@@ -2391,6 +2423,7 @@ def main():
                 # check as markets found in the initial lookup. Otherwise a
                 # delayed listing could be entered despite an existing holding.
                 if newly_discovered and not DRY_RUN:
+                    reconcile_open_orders(newly_discovered)
                     _reconcile_startup_positions(newly_discovered)
                 next_discovery_at = time.time() + DISCOVERY_RETRY_SEC
 
