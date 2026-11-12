@@ -422,36 +422,47 @@ def get_time_remaining(market_ts):
 
 
 def get_order_book(token_id):
-    response = _http_session().get(
-        "https://clob.polymarket.com/book",
-        params={'token_id': token_id},
-        timeout=10,
-    )
-    if response.status_code != 200:
-        return None
-    data = response.json()
-    bids = data.get('bids', [])
-    asks = data.get('asks', [])
-    if not bids and not asks:
-        return None
-    best_bid = max((float(level['price']) for level in bids), default=None)
-    best_ask = min((float(level['price']) for level in asks), default=None)
-    return {
-        'best_bid': best_bid,
-        'best_ask': best_ask,
-        'bid_queue_shares': sum(
-            float(level.get('size', 0) or 0) for level in bids
-            if best_bid is not None and abs(float(level['price']) - best_bid) < 1e-9
-        ),
-        'bid_depth_shares': sum(
-            float(level.get('size', 0) or 0) for level in bids
-            if best_bid is not None and float(level['price']) >= best_bid - 0.05
-        ),
-        'ask_depth_shares': sum(
-            float(level.get('size', 0) or 0) for level in asks
-            if best_ask is not None and float(level['price']) <= best_ask + 0.05
-        ),
-    }
+    for attempt in range(3):
+        try:
+            response = _http_session().get(
+                "https://clob.polymarket.com/book",
+                params={'token_id': token_id},
+                timeout=10,
+            )
+            if response.status_code == 429:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            if response.status_code != 200:
+                return None
+            data = response.json()
+            bids = data.get('bids', [])
+            asks = data.get('asks', [])
+            if not bids and not asks:
+                return None
+            best_bid = max((float(level['price']) for level in bids), default=None)
+            best_ask = min((float(level['price']) for level in asks), default=None)
+            return {
+                'best_bid': best_bid,
+                'best_ask': best_ask,
+                'bid_queue_shares': sum(
+                    float(level.get('size', 0) or 0) for level in bids
+                    if best_bid is not None and abs(float(level['price']) - best_bid) < 1e-9
+                ),
+                'bid_depth_shares': sum(
+                    float(level.get('size', 0) or 0) for level in bids
+                    if best_bid is not None and float(level['price']) >= best_bid - 0.05
+                ),
+                'ask_depth_shares': sum(
+                    float(level.get('size', 0) or 0) for level in asks
+                    if best_ask is not None and float(level['price']) <= best_ask + 0.05
+                ),
+            }
+        except (requests.RequestException, ValueError, KeyError, TypeError):
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            return None
+    return None
 
 
 def get_order_books_batch(token_ids):
@@ -459,49 +470,62 @@ def get_order_books_batch(token_ids):
     token_ids = [str(token_id) for token_id in token_ids]
     if not token_ids:
         return {}
-    response = _http_session().post(
-        "https://clob.polymarket.com/books",
-        json=[{"token_id": token_id} for token_id in token_ids],
-        timeout=6,
-    )
-    if response.status_code != 200:
-        raise requests.RequestException(f"batch books returned HTTP {response.status_code}")
-    payload = response.json()
-    if not isinstance(payload, list):
-        raise ValueError("batch books response was not a list")
-    books = {}
-    for index, raw_book in enumerate(payload):
-        token_id = str(
-            raw_book.get('asset_id')
-            or raw_book.get('token_id')
-            or (token_ids[index] if index < len(token_ids) else '')
-        )
-        if not token_id:
-            continue
-        bids = raw_book.get('bids', [])
-        asks = raw_book.get('asks', [])
-        if not bids and not asks:
-            books[token_id] = None
-            continue
-        books[token_id] = {
-            'best_bid': max((float(level['price']) for level in bids), default=None),
-            'best_ask': min((float(level['price']) for level in asks), default=None),
-        }
-        best_bid = books[token_id]['best_bid']
-        best_ask = books[token_id]['best_ask']
-        books[token_id]['bid_queue_shares'] = sum(
-            float(level.get('size', 0) or 0) for level in bids
-            if best_bid is not None and abs(float(level['price']) - best_bid) < 1e-9
-        )
-        books[token_id]['bid_depth_shares'] = sum(
-            float(level.get('size', 0) or 0) for level in bids
-            if float(level['price']) >= 0.90
-        )
-        books[token_id]['ask_depth_shares'] = sum(
-            float(level.get('size', 0) or 0) for level in asks
-            if best_ask is not None and float(level['price']) <= best_ask + 0.05
-        )
-    return books
+    for attempt in range(3):
+        try:
+            response = _http_session().post(
+                "https://clob.polymarket.com/books",
+                json=[{"token_id": token_id} for token_id in token_ids],
+                timeout=6,
+            )
+            if response.status_code == 429 or response.status_code >= 500:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            if response.status_code != 200:
+                raise requests.RequestException(
+                    f"batch books returned HTTP {response.status_code}")
+            payload = response.json()
+            if not isinstance(payload, list):
+                raise ValueError("batch books response was not a list")
+            books = {}
+            for index, raw_book in enumerate(payload):
+                token_id = str(
+                    raw_book.get('asset_id')
+                    or raw_book.get('token_id')
+                    or (token_ids[index] if index < len(token_ids) else '')
+                )
+                if not token_id:
+                    continue
+                bids = raw_book.get('bids', [])
+                asks = raw_book.get('asks', [])
+                if not bids and not asks:
+                    books[token_id] = None
+                    continue
+                best_bid = max((float(level['price']) for level in bids), default=None)
+                best_ask = min((float(level['price']) for level in asks), default=None)
+                books[token_id] = {
+                    'best_bid': best_bid,
+                    'best_ask': best_ask,
+                    'bid_queue_shares': sum(
+                        float(level.get('size', 0) or 0) for level in bids
+                        if best_bid is not None and abs(float(level['price']) - best_bid) < 1e-9
+                    ),
+                    'bid_depth_shares': sum(
+                        float(level.get('size', 0) or 0) for level in bids
+                        if float(level['price']) >= 0.90
+                    ),
+                    'ask_depth_shares': sum(
+                        float(level.get('size', 0) or 0) for level in asks
+                        if best_ask is not None and float(level['price']) <= best_ask + 0.05
+                    ),
+                }
+            return books
+        except (requests.RequestException, ValueError, TypeError):
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            log_event("Batch order-book request failed", "yellow")
+            return {token_id: None for token_id in token_ids}
+    return {token_id: None for token_id in token_ids}
 
 
 def get_market_info(market_ts, symbol):
@@ -579,6 +603,44 @@ def position_shares_for_token(token_id):
     except Exception as e:
         log_event(f"positions fetch failed: {e}", "yellow")
         return None
+
+
+def _reconcile_startup_positions(market_states):
+    """Live-only: adopt any position the account already holds in this window.
+
+    The bot normally assumes a clean slate. If it restarts mid-market with an
+    open position it would otherwise re-enter and double up, so detect and
+    adopt existing holdings before the main loop starts. Reservations are
+    taken at the 0.95 cap (worst case) because the real entry price is unknown.
+    """
+    if DRY_RUN:
+        return
+    for symbol, state in market_states.items():
+        info = state.get("market_info") or {}
+        for side, key in (("UP", "up_token_id"), ("DOWN", "down_token_id")):
+            token_id = info.get(key)
+            if not token_id:
+                continue
+            shares = position_shares_for_token(token_id)
+            if not shares or shares <= 0:
+                continue
+            if state.get("entered"):
+                continue
+            state["favored_side"] = side
+            state["favored_token_id"] = str(token_id)
+            state["entered"] = True
+            state["filled_shares"] = float(shares)
+            state["entry_fill_price"] = MAX_BUY_PRICE
+            state["filled_cost"] = float(shares) * MAX_BUY_PRICE
+            state["signal_counted"] = True
+            exposure_key = f"startup:{symbol}:{side}"
+            state["exposure_key"] = exposure_key
+            OPEN_ORDER_COSTS[exposure_key] = state["filled_cost"]
+            log_event(
+                f"{symbol} startup reconciliation: adopted {shares:.2f} {side} "
+                f"shares already on book (reserved ${state['filled_cost']:.2f})",
+                "yellow",
+            )
 
 
 # ============================================================================
@@ -2113,6 +2175,8 @@ def main():
                 next_discovery_at = time.time() + DISCOVERY_RETRY_SEC
                 if not market_states:
                     log_event("No target crypto markets listed yet; will retry", "yellow")
+                if market_states and not DRY_RUN:
+                    _reconcile_startup_positions(market_states)
 
             missing = [symbol for symbol in CRYPTO_ASSETS if symbol not in market_states]
             # Market discovery can block on network timeouts. Stop retrying

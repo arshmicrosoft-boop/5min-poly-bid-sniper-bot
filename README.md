@@ -139,7 +139,12 @@ Two paths — pick by accuracy need:
 python .\backtest\backtest.py record --output .\data\market_data.jsonl
 python .\backtest\backtest_rigorous.py --input .\data\market_data.jsonl --days 30
 ```
-- Captures real books, trades, and `market_resolved` (Chainlink settlement).
+- Captures real books, trades, and `market_resolved` (Chainlink settlement). The recorder
+  is implemented in `poly5m/ws_collector.py` (WS market stream + Binance candles).
+- Book snapshots are coalesced to 1s and filtered to the levels the strategy reads
+  (bids >= 0.85, asks <= 0.15, plus the touch), so a 14-day file is ~8 GB rather
+  than the ~90 GB the raw tape would be. Use `--bucket 2.0` or `--max-mb` to trade
+  resolution for size.
 - Queue-aware fills, latency, cancel-confirm, fees, slippage.
 - 12 qualification gates: walk-forward, block sign-flip, bootstrap CI, placebo, stress, kill-switch, plateau, etc.
 

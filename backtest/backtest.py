@@ -447,6 +447,8 @@ def main():
     rec.add_argument("--output", default="data/market_data.jsonl")
     rec.add_argument("--assets", default="", help="comma list, e.g. BTC,ETH (default all)")
     rec.add_argument("--duration", type=float, default=0.0, help="seconds (0 = forever)")
+    rec.add_argument("--bucket", type=float, default=1.0, help="book snapshot cadence in seconds")
+    rec.add_argument("--max-mb", type=float, default=20000.0, help="stop cleanly after this many MB")
     rep = sub.add_parser("report")
     rep.add_argument("--input", default="data/market_data.jsonl")
     rep.add_argument("--latency-ms", type=int, default=DEFAULT_LATENCY_MS)
@@ -458,7 +460,7 @@ def main():
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         from poly5m.ws_collector import record
 
-        record(args.output, args.assets, args.duration)
+        record(args.output, args.assets, args.duration, 45.0, args.bucket, args.max_mb)
     else:
         print("Report: run backtest_rigorous.py instead.")
 
