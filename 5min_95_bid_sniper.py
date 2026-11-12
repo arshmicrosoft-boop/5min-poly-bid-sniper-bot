@@ -38,6 +38,10 @@ import requests
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from termcolor import colored
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 # Auto re-exec with tflow python if we're in the wrong env
 TFLOW_PYTHON = "/opt/anaconda3/envs/tflow/bin/python"
@@ -81,8 +85,9 @@ MAX_BUY_PRICE = float(os.getenv("MAX_BUY_PRICE", "0.95"))
 MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "10.0"))
 ENTRY_WINDOW_SEC = int(os.getenv("ENTRY_WINDOW_SEC", "60"))
 STOP_THRESHOLD_SEC = int(os.getenv("STOP_THRESHOLD_SEC", "5"))
-ORDER_UPDATE_INTERVAL = int(os.getenv("ORDER_UPDATE_INTERVAL", "3"))
+ORDER_UPDATE_INTERVAL = int(os.getenv("ORDER_UPDATE_INTERVAL", "1"))
 PRICE_HOLD_TOLERANCE = float(os.getenv("PRICE_HOLD_TOLERANCE", "0.005"))
+KILL_SWITCH_FILE = os.getenv("KILL_SWITCH_FILE", "KILL")
 
 MARKET_DURATION = 300
 ET = timezone(timedelta(hours=-5))
@@ -130,6 +135,7 @@ HYPE_MESSAGES = [
 ]
 
 SPINNER_FRAMES = itertools.cycle(["o", "O", "0", "."])
+_DASHBOARD_FRAME = itertools.count()
 ROCKET_FRAMES = itertools.cycle(["^   ", " ^  ", "  ^ ", "   ^", "  ^ ", " ^  "])
 
 EVENT_LOG = deque(maxlen=6)
@@ -597,12 +603,35 @@ def _validate_configuration():
 
 def _draw_panel(title, rows, color="cyan"):
     width = max(60, min(120, shutil.get_terminal_size((120, 24)).columns))
+    frame = next(_DASHBOARD_FRAME)
     print(colored("+" + "-" * (width - 2) + "+", color))
     print(colored("| " + title[:width - 4].ljust(width - 4) + " |", color, attrs=["bold"]))
     print(colored("+" + "-" * (width - 2) + "+", color))
     for row in rows:
         # Keep the display inside the frame and avoid terminal wrapping.
-        print("| " + row[:width - 4].ljust(width - 4) + " |")
+        clipped = row[:width - 4].ljust(width - 4)
+        lower = row.lower()
+        row_color, attrs = None, []
+        if row.startswith(("POLYMARKET", "MULTI-CRYPTO", "SESSION TELEMETRY", "CAPITAL & RISK", "ORDER & EXECUTION", "SYSTEM & DISCOVERY")):
+            row_color, attrs = "cyan", ["bold"]
+        elif "phase:" in lower and "cutoff" in lower:
+            row_color, attrs = "red", ["bold"]
+        elif "phase:" in lower and "snipe window" in lower:
+            row_color, attrs = ("green", ["bold"]) if frame % 2 else ("white", ["bold"])
+        elif "phase:" in lower:
+            row_color = "yellow"
+        elif any(marker in lower for marker in ("[decided", " hold ", "filled", " matched ")):
+            row_color = "green"
+        elif any(marker in lower for marker in ("capped", " timeout", "failed", "error", " live bid")):
+            row_color = "red"
+        elif any(marker in lower for marker in ("chop", "undecided", "watching", "away)", "waiting")):
+            row_color = "yellow"
+        elif row.startswith(("=", "-")):
+            row_color = "cyan"
+        if row_color:
+            print(colored("| " + clipped + " |", row_color, attrs=attrs))
+        else:
+            print("| " + clipped + " |")
     print(colored("+" + "-" * (width - 2) + "+", color))
 
 
@@ -627,6 +656,7 @@ def draw_dashboard(market_states, market_books, time_left):
         phase, poll_interval = "WAITING FOR FINAL 60s", 3.0
     progress = int(max(0, min(24, round((MARKET_DURATION - left) / MARKET_DURATION * 24))))
     timer_bar = "#" * progress + "." * (24 - progress)
+    spinner = next(SPINNER_FRAMES)
     account = ACCOUNT_SUFFIX.lstrip("_") or "default"
     address = os.getenv(PUBLIC_KEY_ENV_NAME, "")
     short_address = f"{address[:6]}..{address[-4:]}" if len(address) >= 12 else "unavailable"
@@ -655,7 +685,7 @@ def draw_dashboard(market_states, market_books, time_left):
     exposure_ratio = min(1.0, total_exposure / MAX_TOTAL_EXPOSURE_USD) if MAX_TOTAL_EXPOSURE_USD > 0 else 1.0
     exposure_bar = "#" * round(exposure_ratio * 20) + "." * (20 - round(exposure_ratio * 20))
     rows = [
-        f"POLYMARKET 5M 95c BID SNIPER v1.1 | ACCT: {account} ({short_address}) | MODE: {mode}",
+        f"{spinner} POLYMARKET 5M 95c BID SNIPER v1.1 | ACCT: {account} ({short_address}) | MODE: {mode}",
         f"UPTIME: {runtime} | POLL: {poll_interval:.1f}s ({'FAST' if poll_interval == 1.0 else 'SLOW'}) | CLOB PING: {ping_text} | LOG: sniper_session.log",
         "=" * 100,
         f"WINDOW: {window_start} -> {window_end} ET (id: {market_ts}) | PHASE: {phase}",
@@ -663,6 +693,7 @@ def draw_dashboard(market_states, market_books, time_left):
         "-" * 100,
         "CAPITAL & RISK METRICS",
         f"USDC Balance: unavailable | Window Exposure: ${total_exposure:.2f} / ${MAX_TOTAL_EXPOSURE_USD:.2f} [{exposure_bar}]",
+        f"KILL SWITCH: press 'k'/'q' in this terminal, or `echo > {KILL_SWITCH_FILE}` (env KILL_SWITCH=1). Cancels all open orders and exits.",
         f"Open Bids: {open_bid_shares:.2f}sh (${open_bid_cost:.2f}) | Filled Holding: {filled_shares:.2f}sh (${filled_cost:.2f}) | Other Reserved: ${other_reserved:.2f}",
         f"Est Payout: ${filled_shares:.2f} if all current filled shares resolve to $1 | Resolved PnL / win rate: unavailable (settlements not tracked)",
         "=" * 100,
@@ -896,6 +927,45 @@ def main():
 
     try:
         while True:
+            # ---- Kill switch: file trigger (create `KILL` file) or press 'k'/'q' ----
+            kill_triggered = (
+                os.path.exists(KILL_SWITCH_FILE)
+                or os.getenv("KILL_SWITCH", "").strip().lower() in {"1", "true", "yes", "on"}
+            )
+            if not kill_triggered and msvcrt is not None:
+                try:
+                    while msvcrt.kbhit():
+                        ch = msvcrt.getch()
+                        if ch in (b"k", b"K", b"q", b"Q"):
+                            kill_triggered = True
+                except Exception:
+                    pass
+            if kill_triggered:
+                log_event("KILL SWITCH triggered - canceling all open orders and shutting down", "red")
+                cancel_futures = {
+                    executor.submit(
+                        _cancel_and_confirm,
+                        ms["favored_token_id"],
+                        ms["last_order_id"],
+                        0.2,
+                        ms.get("exposure_key"),
+                    ): (sym, ms)
+                    for sym, ms in market_states.items()
+                    if ms.get("last_order_id") and ms.get("favored_token_id")
+                }
+                for future in as_completed(cancel_futures):
+                    sym, ms = cancel_futures[future]
+                    try:
+                        outcome, status = future.result()
+                    except Exception:
+                        outcome, status = "FAILED", None
+                    settle_cancel(sym, ms, outcome, status)
+                try:
+                    if os.path.exists(KILL_SWITCH_FILE):
+                        os.remove(KILL_SWITCH_FILE)
+                except Exception:
+                    pass
+                break
             now = time.time()
             market_ts = get_current_market_timestamp()
 
