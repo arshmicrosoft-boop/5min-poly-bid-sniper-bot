@@ -80,9 +80,13 @@ SIGNATURE_TYPE = 1 if ACCOUNT_SUFFIX == "" else 2
 # STRATEGY CONFIGURATION
 # ============================================================================
 BET_SIZE_USD = float(os.getenv("BET_SIZE_USD", "1.0"))
+DRY_RUN_FEE_RATE = float(os.getenv("DRY_RUN_FEE_RATE", "0.0"))
+DRY_RUN_SLIPPAGE = float(os.getenv("DRY_RUN_SLIPPAGE", "0.001"))
 ENTRY_THRESHOLD = float(os.getenv("ENTRY_THRESHOLD", "0.95"))
 MAX_BUY_PRICE = float(os.getenv("MAX_BUY_PRICE", "0.95"))
 MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "10.0"))
+MAX_SESSION_LOSS_USD = float(os.getenv("MAX_SESSION_LOSS_USD", "6.0"))
+SIM_BANKROLL_USD = float(os.getenv("SIM_BANKROLL_USD", "10.0"))
 MIN_DECIDED_BID = float(os.getenv("MIN_DECIDED_BID", "0.88"))
 MAX_OPPOSITE_BID = float(os.getenv("MAX_OPPOSITE_BID", "0.08"))
 EARLY_WINDOW_MAX_BUY_PRICE = float(os.getenv("EARLY_WINDOW_MAX_BUY_PRICE", "0.93"))
@@ -116,6 +120,10 @@ SESSION_PAPER_LOSSES = 0
 SESSION_PAPER_PNL = 0.0
 SESSION_PAPER_COST = 0.0
 SESSION_PAPER_SHARES = 0.0
+SESSION_FILL_PRICES = []
+SESSION_PAPER_PEAK_PNL = 0.0
+SESSION_MAX_DD = 0.0
+SESSION_CURRENT_STREAK = 0
 SESSION_START = time.time()
 
 # ============================================================================
@@ -332,7 +340,8 @@ def place_limit_order(token_id, side, price, size, neg_risk=False):
         }
         OPEN_ORDER_COSTS[order_id] = float(price) * float(size)
         global SESSION_PAPER_COST, SESSION_PAPER_SHARES
-        SESSION_PAPER_COST += float(price) * float(size)
+        order_cost = float(price) * float(size) + (float(price) * DRY_RUN_FEE_RATE + DRY_RUN_SLIPPAGE) * float(size)
+        SESSION_PAPER_COST += order_cost
         SESSION_PAPER_SHARES += float(size)
         log_event(f"DRY RUN: simulated {side} @ ${price:.4f} x {size} (memory only)", "yellow")
         return {'orderID': order_id, 'status': 'LIVE', 'simulated': True}
@@ -429,9 +438,23 @@ def get_order_book(token_id):
     asks = data.get('asks', [])
     if not bids and not asks:
         return None
+    best_bid = max((float(level['price']) for level in bids), default=None)
+    best_ask = min((float(level['price']) for level in asks), default=None)
     return {
-        'best_bid': max((float(level['price']) for level in bids), default=None),
-        'best_ask': min((float(level['price']) for level in asks), default=None),
+        'best_bid': best_bid,
+        'best_ask': best_ask,
+        'bid_queue_shares': sum(
+            float(level.get('size', 0) or 0) for level in bids
+            if best_bid is not None and abs(float(level['price']) - best_bid) < 1e-9
+        ),
+        'bid_depth_shares': sum(
+            float(level.get('size', 0) or 0) for level in bids
+            if best_bid is not None and float(level['price']) >= best_bid - 0.05
+        ),
+        'ask_depth_shares': sum(
+            float(level.get('size', 0) or 0) for level in asks
+            if best_ask is not None and float(level['price']) <= best_ask + 0.05
+        ),
     }
 
 
@@ -467,12 +490,21 @@ def get_order_books_batch(token_ids):
         books[token_id] = {
             'best_bid': max((float(level['price']) for level in bids), default=None),
             'best_ask': min((float(level['price']) for level in asks), default=None),
-            'bid_depth_shares': sum(
-                float(level.get('size', 0) or 0)
-                for level in bids
-                if float(level['price']) >= 0.90
-            ),
         }
+        best_bid = books[token_id]['best_bid']
+        best_ask = books[token_id]['best_ask']
+        books[token_id]['bid_queue_shares'] = sum(
+            float(level.get('size', 0) or 0) for level in bids
+            if best_bid is not None and abs(float(level['price']) - best_bid) < 1e-9
+        )
+        books[token_id]['bid_depth_shares'] = sum(
+            float(level.get('size', 0) or 0) for level in bids
+            if float(level['price']) >= 0.90
+        )
+        books[token_id]['ask_depth_shares'] = sum(
+            float(level.get('size', 0) or 0) for level in asks
+            if best_ask is not None and float(level['price']) <= best_ask + 0.05
+        )
     return books
 
 
@@ -704,6 +736,7 @@ def _simulate_paper_fills(market_states, market_books):
             continue
         order['status'] = 'MATCHED'
         order['size_matched'] = float(order['size'])
+        SESSION_FILL_PRICES.append(float(order['price']))
         log_event(
             f"{symbol} DRY RUN PAPER FILL: ask {best_ask:.3f} reached bid {order['price']:.3f}; "
             f"{order['size_matched']:.2f} shares (book-touch model)",
@@ -739,7 +772,7 @@ def _validate_configuration():
 
 def _resolve_paper_window(market_states, market_books):
     """Estimate paper outcomes from the final cached book, not official settlement."""
-    global SESSION_PAPER_WINS, SESSION_PAPER_LOSSES, SESSION_PAPER_PNL
+    global SESSION_PAPER_WINS, SESSION_PAPER_LOSSES, SESSION_PAPER_PNL, SESSION_PAPER_PEAK_PNL, SESSION_MAX_DD, SESSION_CURRENT_STREAK
     if not DRY_RUN:
         return
     for symbol, state in market_states.items():
@@ -766,11 +799,20 @@ def _resolve_paper_window(market_states, market_books):
         state['paper_resolved'] = True
         if result == "WIN":
             SESSION_PAPER_WINS += 1
-            pnl = shares - cost
+            fees_slip = (entry * DRY_RUN_FEE_RATE + DRY_RUN_SLIPPAGE) * shares
+            pnl = (shares * 1.0 - cost) - fees_slip
+            SESSION_CURRENT_STREAK = SESSION_CURRENT_STREAK + 1 if SESSION_CURRENT_STREAK >= 0 else 1
         else:
             SESSION_PAPER_LOSSES += 1
-            pnl = -cost
+            fees_slip = (entry * DRY_RUN_FEE_RATE + DRY_RUN_SLIPPAGE) * shares
+            pnl = -(cost + fees_slip)
+            SESSION_CURRENT_STREAK = SESSION_CURRENT_STREAK - 1 if SESSION_CURRENT_STREAK <= 0 else -1
         SESSION_PAPER_PNL += pnl
+        if SESSION_PAPER_PNL > SESSION_PAPER_PEAK_PNL:
+            SESSION_PAPER_PEAK_PNL = SESSION_PAPER_PNL
+        drawdown = SESSION_PAPER_PEAK_PNL - SESSION_PAPER_PNL
+        if drawdown > SESSION_MAX_DD:
+            SESSION_MAX_DD = drawdown
         log_event(
             f"{symbol} PAPER {result} estimate from final cached book; PnL {pnl:+.2f}",
             "green" if result == "WIN" else "red",
@@ -827,6 +869,7 @@ SCANNER_HEADERS = {
     "DOWN": "DOWN BID/ASK",
     "LEAD": "LEAD",
     "GAP": "GAP",
+    "STRIKE": "STRIKE Δ",
 }
 
 
@@ -958,6 +1001,64 @@ def _split_row(left, right, width, gap=2):
         if left_width + gap + right_width <= width:
             return left + [_seg(" " * (width - left_width - right_width))] + right
     return _fit(left, width)
+
+
+_STRIKE_CACHE = {}
+_STRIKE_LOCK = threading.Lock()
+_STRIKE_TTL = 30.0
+_STRIKE_PAIRS = {
+    "BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT",
+    "XRP": "XRPUSDT", "DOGE": "DOGEUSDT",
+}
+
+
+def _strike_delta(symbol):
+    pair = _STRIKE_PAIRS.get(symbol)
+    if not pair:
+        return None
+    now = time.time()
+    with _STRIKE_LOCK:
+        cached = _STRIKE_CACHE.get(symbol)
+        if cached and now - cached[0] < _STRIKE_TTL:
+            return cached[1]
+    text = None
+    try:
+        kline = _http_session().get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": pair, "interval": "5m", "limit": 1},
+            timeout=2,
+        ).json()
+        spot = float(
+            _http_session().get(
+                "https://api.binance.com/api/v3/ticker/price",
+                params={"symbol": pair},
+                timeout=2,
+            ).json()["price"]
+        )
+        open_price = float(kline[0][1])
+        if open_price > 0:
+            delta = (spot - open_price) / open_price * 100.0
+            text = f"{delta:+.2f}%"
+    except Exception:
+        text = None
+    with _STRIKE_LOCK:
+        _STRIKE_CACHE[symbol] = (now, text)
+    return text
+
+
+def _strike_color(text):
+    if not text:
+        return C_MUTED
+    try:
+        value = float(text.rstrip("%"))
+    except ValueError:
+        return C_MUTED
+    magnitude = abs(value)
+    if magnitude >= 0.20:
+        return C_GOOD
+    if magnitude >= 0.08:
+        return C_WARN
+    return C_BAD
 
 
 def _money(value):
@@ -1169,6 +1270,11 @@ def draw_dashboard(market_states, market_books, time_left):
             _kpi("ui", ui_text, _latency_color(ui['last'] if ui else None)),
         ]
 
+    bankroll_label = "sim" if DRY_RUN else "usdc"
+    bankroll_text = (
+        f"${SIM_BANKROLL_USD + SESSION_PAPER_PNL:.2f}" if DRY_RUN else "USDC --"
+    )
+
     header_rows = [
         _split_row(
             [
@@ -1179,7 +1285,11 @@ def draw_dashboard(market_states, market_books, time_left):
                 _seg(f" {_G['dot']} ", C_BORDER),
                 _seg(short_address, C_MUTED),
             ],
-            [_kpi("uptime", runtime)],
+            [
+                _kpi("uptime", runtime),
+                _seg("   "),
+                _kpi(bankroll_label, bankroll_text, C_ACCENT),
+            ],
             content_w,
         ),
         _split_row(tagline, latency_bits, content_w),
@@ -1308,6 +1418,7 @@ def draw_dashboard(market_states, market_books, time_left):
     # The five-column table needs ~56 visible cells plus room for a status
     # message, so drop LEAD/GAP only below that.
     compact = width < 76
+    wide = width >= 96 and not compact
     gap = 1 if compact else 2
     quote_sep = "" if compact else " "
     quote_width = 12 if compact else 13
@@ -1316,6 +1427,8 @@ def draw_dashboard(market_states, market_books, time_left):
         if not compact else
         [("ASSET", 6), ("UP", quote_width), ("DOWN", quote_width)]
     )
+    if wide:
+        columns = columns + [("STRIKE", 9)]
     while columns and content_w - sum(w for _, w in columns) - gap * len(columns) < 10:
         columns = columns[:-1]
     status_w = max(
@@ -1333,6 +1446,8 @@ def draw_dashboard(market_states, market_books, time_left):
         return segments
 
     headers = dict(SCANNER_HEADERS)
+    if wide:
+        headers["STRIKE"] = "STRIKE Δ"
     scanner_rows = [table_row(
         {key: (headers[key], C_MUTED, True) for key, _ in columns},
         ("EXECUTION", C_MUTED),
@@ -1413,7 +1528,14 @@ def draw_dashboard(market_states, market_books, time_left):
             )
         elif state.get('last_order_id'):
             kind = "SIM BID" if DRY_RUN else "LIVE BID"
-            status = (f"{kind} {float(state.get('last_order_price') or 0):.3f}", C_ACCENT)
+            price = float(state.get('last_order_price') or 0.0)
+            shares = calculate_shares(BET_SIZE_USD, price) if price > 0 else 0.0
+            edge = shares * (1.0 - price)
+            book = up_book if state.get('favored_side') == "UP" else down_book
+            queue = (book or {}).get('bid_queue_shares') or 0
+            q_text = f"  Q {queue:.0f}sh" if queue else ""
+            color = C_ACCENT if DRY_RUN else C_GOOD
+            status = (f"{kind} {price:.3f} · +${edge:.2f}{q_text}", color)
         elif qualified_side:
             try:
                 favored_book = up_book if qualified_side == "UP" else down_book
@@ -1427,7 +1549,14 @@ def draw_dashboard(market_states, market_books, time_left):
                         status = ("SIGNAL / CAPPED", C_WARN)
                     else:
                         edge = shares * (1.0 - target)
-                        status = (f"BID {target:.3f} {_G['dot']} +${edge:.2f}", C_GOOD)
+                        top_bid = up_bid if qualified_side == "UP" else down_bid
+                        q_note = " (-1¢ Q)" if (top_bid is not None and target < top_bid - 0.005) else ""
+                        queue = (favored_book or {}).get('bid_queue_shares') or 0
+                        q_text = f"  Q {queue:.0f}sh" if queue else ""
+                        status = (
+                            f"ARMED {target:.3f}{q_note} (in {to_cutoff}s){q_text}",
+                            C_WARN,
+                        )
             except (TypeError, ValueError, KeyError):
                 status = ("SIGNAL", C_GOOD)
         elif state.get('sharp_ask_drop', {}).get(state.get('favored_side')):
@@ -1442,26 +1571,36 @@ def draw_dashboard(market_states, market_books, time_left):
                 C_MUTED,
             )
 
-        scanner_rows.append(table_row(
-            {
-                "ASSET": (symbol, C_TEXT, True),
-                "UP": (up_text, up_color, False),
-                "DOWN": (down_text, down_color, False),
-                "LEAD": (leading_side or "--", lead_color, True),
-                "GAP": (gap_text, gap_color, False),
-            },
-            status,
-        ))
+        strike_text = _strike_delta(symbol) if wide else None
+        cells = {
+            "ASSET": (symbol, C_TEXT, True),
+            "UP": (up_text, up_color, False),
+            "DOWN": (down_text, down_color, False),
+            "LEAD": (leading_side or "--", lead_color, True),
+            "GAP": (gap_text, gap_color, False),
+        }
+        if wide:
+            cells["STRIKE"] = (strike_text or "--", _strike_color(strike_text), False)
+        scanner_rows.append(table_row(cells, status))
 
     # ---- session telemetry -------------------------------------------------
     fill_rate = (SESSION_ENTRIES / SESSION_SIGNALS * 100.0) if SESSION_SIGNALS else 0.0
     if DRY_RUN:
         resolved = SESSION_PAPER_WINS + SESSION_PAPER_LOSSES
         win_rate = (SESSION_PAPER_WINS / resolved * 100.0) if resolved else 0.0
+        avg_fill = (
+            sum(SESSION_FILL_PRICES) / len(SESSION_FILL_PRICES)
+            if SESSION_FILL_PRICES else 0.0
+        )
+        be_wr = avg_fill * 100.0
         result_bits = [
             _kpi("paper", f"{SESSION_PAPER_WINS}W/{SESSION_PAPER_LOSSES}L"),
             _seg("  "),
             _kpi("wr", f"{win_rate:.0f}%", C_GOOD if win_rate >= 50 else C_TEXT),
+            _seg("  "),
+            _kpi("be", f"{be_wr:.1f}%", C_MUTED),
+            _seg("  "),
+            _kpi("avg", f"${avg_fill:.3f}", C_TEXT),
             _seg("  "),
             _kpi("pnl", _signed_money(SESSION_PAPER_PNL),
                  C_GOOD if SESSION_PAPER_PNL > 0 else C_BAD if SESSION_PAPER_PNL < 0 else C_TEXT),
@@ -1491,6 +1630,14 @@ def draw_dashboard(market_states, market_books, time_left):
                 _kpi("cutoff cancels", SESSION_CUTOFF_CANCELS),
                 _seg("   "),
                 _kpi("skips", SESSION_SKIPS),
+                _seg("   "),
+                _kpi("max dd", _signed_money(-SESSION_MAX_DD),
+                     C_BAD if SESSION_MAX_DD > 0 else C_MUTED),
+                _seg("   "),
+                _kpi("streak", f"{SESSION_CURRENT_STREAK:+d}",
+                     C_GOOD if SESSION_CURRENT_STREAK > 0 else C_BAD if SESSION_CURRENT_STREAK < 0 else C_MUTED),
+                _seg("   "),
+                _kpi("kill", f"-${MAX_SESSION_LOSS_USD:.0f}", C_MUTED),
             ],
             content_w,
         ),
@@ -1738,7 +1885,7 @@ def _clear_order_state(market_state):
 
 def _record_fill(symbol, market_state, fill_status, preserve_open_order=False):
     """Record any matched quantity while keeping its cost reserved this window."""
-    global SESSION_ENTRIES
+    global SESSION_ENTRIES, SESSION_FILL_PRICES
     if not fill_status:
         return
     matched = float(fill_status.get('size_matched') or 0.0)
@@ -1748,6 +1895,7 @@ def _record_fill(symbol, market_state, fill_status, preserve_open_order=False):
     exposure_key = str(market_state.get('exposure_key') or market_state.get('last_order_id') or '')
     if matched > 0 and price > 0 and exposure_key and not preserve_open_order:
         OPEN_ORDER_COSTS[exposure_key] = matched * price
+        SESSION_FILL_PRICES.append(price)
     if matched > market_state.get('filled_shares', 0.0):
         market_state['filled_shares'] = matched
         market_state['filled_cost'] = matched * price
