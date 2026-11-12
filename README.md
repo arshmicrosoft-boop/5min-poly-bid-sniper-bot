@@ -59,7 +59,7 @@ From the repository root in PowerShell:
 python .\5min_95_bid_sniper.py
 ```
 
-The terminal dashboard shows the active market and timer, both order books, selected side, order state, session counts, and recent events. Press `Ctrl+C` to stop.
+The terminal dashboard is split into panels: market window and progress bar, capital and risk (exposure gauge, open bids, holdings, max loss/profit), a scanner table for all five assets, session telemetry (fill rate, paper win rate/PnL, timeouts, skips), execution log, and discovery log. It also reports polling, CLOB, order, cancel, and UI latency. Press `Ctrl+C` to stop. Set `SNIPER_ASCII_UI=1` to force ASCII borders on terminals that cannot print box-drawing characters.
 
 **Dry run is the default.** It reads live public market data and keeps simulated order state in process memory. It does not connect to your account or place orders. A paper order is marked filled when the live best ask reaches or crosses its bid; this book-touch model assumes a full fill and does not model queue priority, available size, or actual trades. At window rollover, paper results use the last cached book and a 98¢ bid threshold as a directional outcome proxy, not official settlement. Paper state disappears when the process exits. No `.env` file or credentials are needed for dry run.
 
@@ -69,7 +69,7 @@ Run the dry mode:
 python .\5min_95_bid_sniper.py
 ```
 
-To enable live order submission, set `DRY_RUN=false` in `.env` and configure valid wallet credentials. The dashboard then labels the mode `LIVE ORDERS`. The default strategy settings are in `5min_95_bid_sniper.py`:
+To enable live order submission, set `DRY_RUN=false` in `.env` and configure valid wallet credentials. The dashboard then labels the mode `LIVE MAKER`. The default strategy settings are in `5min_95_bid_sniper.py`:
 
 | Setting | Default |
 | --- | ---: |

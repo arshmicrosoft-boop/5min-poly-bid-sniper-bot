@@ -140,10 +140,8 @@ HYPE_MESSAGES = [
     "soggybiscuits2 = the closer",
 ]
 
-SPINNER_FRAMES = itertools.cycle(["o", "O", "0", "."])
 _DASHBOARD_FRAME = itertools.count()
 DASHBOARD_RENDERED = False
-ROCKET_FRAMES = itertools.cycle(["^   ", " ^  ", "  ^ ", "   ^", "  ^ ", " ^  "])
 
 EVENT_LOG = deque(maxlen=6)
 ORDER_LOG = deque(maxlen=5)
@@ -151,6 +149,20 @@ _SESSION_LOG_LOCK = threading.Lock()
 _THREAD_LOCAL = threading.local()
 _PING_LOCK = threading.Lock()
 CLOB_PING_MS = deque(maxlen=30)
+
+# Round-trip timings surfaced on the dashboard. CLOB_PING_MS holds the public
+# book-fetch latency; these track the account-side calls (live mode only) and
+# the time spent building each dashboard frame.
+ORDER_LATENCY_MS = deque(maxlen=30)
+CANCEL_LATENCY_MS = deque(maxlen=30)
+RENDER_LATENCY_MS = deque(maxlen=30)
+_LATENCY_LOCK = threading.Lock()
+
+
+def _record_latency(bucket, started):
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    with _LATENCY_LOCK:
+        bucket.append(elapsed_ms)
 
 
 def _http_session():
@@ -334,6 +346,7 @@ def place_limit_order(token_id, side, price, size, neg_risk=False):
 
     options = PartialCreateOrderOptions(neg_risk=True) if neg_risk else None
 
+    started = time.perf_counter()
     try:
         response = client.create_and_post_order(
             order_args,
@@ -354,6 +367,8 @@ def place_limit_order(token_id, side, price, size, neg_risk=False):
             return {'orderID': 'timeout-assumed-live', 'status': 'LIVE'}
         log_event(f"post_order failed: {type(e).__name__}: {e}", "red")
         return {}
+    finally:
+        _record_latency(ORDER_LATENCY_MS, started)
 
 
 def cancel_token_orders_acct(token_id, order_id=None):
@@ -368,6 +383,7 @@ def cancel_token_orders_acct(token_id, order_id=None):
 
     from py_clob_client_v2.clob_types import OrderMarketCancelParams, OrderPayload
     client = _build_client()
+    started = time.perf_counter()
     try:
         if order_id and order_id != 'timeout-assumed-live':
             client.cancel_order(OrderPayload(orderID=str(order_id)))
@@ -378,6 +394,8 @@ def cancel_token_orders_acct(token_id, order_id=None):
     except Exception as e:
         log_event(f"Cancel failed: {type(e).__name__}: {e}", "yellow")
         return False
+    finally:
+        _record_latency(CANCEL_LATENCY_MS, started)
 
 
 # ============================================================================
@@ -647,6 +665,7 @@ def new_market_state(market_ts, market_info):
         'neg_risk': False,
         'favored_side': None,
         'favored_token_id': None,
+        'favored_since': 0.0,
         'entered': False,
         'entry_fill_price': None,
         'filled_shares': 0.0,
@@ -752,41 +771,255 @@ def _resolve_paper_window(market_states, market_books):
         )
 
 
-def _draw_panel(title, rows, color="cyan"):
-    width = max(60, min(120, shutil.get_terminal_size((120, 24)).columns))
-    frame = next(_DASHBOARD_FRAME)
-    lines = [
-        colored("+" + "-" * (width - 2) + "+", color),
-        colored("| " + title[:width - 4].ljust(width - 4) + " |", color, attrs=["bold"]),
-        colored("+" + "-" * (width - 2) + "+", color),
-    ]
-    for row in rows:
-        # Keep the display inside the frame and avoid terminal wrapping.
-        clipped = row[:width - 4].ljust(width - 4)
-        lower = row.lower()
-        row_color, attrs = None, []
-        if row.startswith(("POLYMARKET", "MULTI-CRYPTO", "SESSION TELEMETRY", "CAPITAL & RISK", "ORDER & EXECUTION", "SYSTEM & DISCOVERY")):
-            row_color, attrs = "cyan", ["bold"]
-        elif "phase:" in lower and "cutoff" in lower:
-            row_color, attrs = "red", ["bold"]
-        elif "phase:" in lower and "snipe window" in lower:
-            row_color, attrs = ("green", ["bold"]) if frame % 2 else ("white", ["bold"])
-        elif "phase:" in lower:
-            row_color = "yellow"
-        elif any(marker in lower for marker in ("[decided", " hold ", "filled", " matched ")):
-            row_color = "green"
-        elif any(marker in lower for marker in ("capped", " timeout", "failed", "error", " live bid")):
-            row_color = "red"
-        elif any(marker in lower for marker in ("chop", "undecided", "watching", "away)", "waiting")):
-            row_color = "yellow"
-        elif row.startswith(("=", "-")):
-            row_color = "cyan"
-        if row_color:
-            lines.append(colored("| " + clipped + " |", row_color, attrs=attrs))
+# ============================================================================
+# DASHBOARD RENDERING
+# ============================================================================
+# Every line is built from (text, colour, background, bold) segments and padded
+# on the plain text, never on the ANSI escape codes. That keeps the frame and
+# the table columns aligned no matter how much colour is applied.
+
+
+def _detect_unicode():
+    """Use box-drawing glyphs only when the terminal can encode them."""
+    if os.getenv("SNIPER_ASCII_UI", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return False
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        "─│╭╮╰╯█░▁▂▃▄▅▆▇·¢…→".encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
+
+_UI_UNICODE = _detect_unicode()
+_G = (
+    {
+        'h': '─', 'v': '│', 'tl': '╭', 'tr': '╮', 'bl': '╰', 'br': '╯',
+        'fill': '█', 'empty': '░', 'dot': '·', 'cent': '¢', 'arrow': '→',
+        'ellipsis': '…', 'spark': '▁▂▃▄▅▆▇█', 'spinner': '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏',
+    }
+    if _UI_UNICODE else
+    {
+        'h': '-', 'v': '|', 'tl': '+', 'tr': '+', 'bl': '+', 'br': '+',
+        'fill': '#', 'empty': '.', 'dot': '.', 'cent': 'c', 'arrow': '->',
+        'ellipsis': '...', 'spark': '_.:-=+*#', 'spinner': 'oO0.',
+    }
+)
+
+C_BORDER = "dark_grey"
+C_TITLE = "light_cyan"
+C_MUTED = "light_grey"
+C_TEXT = "white"
+C_ACCENT = "cyan"
+C_GOOD = "green"
+C_WARN = "yellow"
+C_BAD = "red"
+
+SCANNER_HEADERS = {
+    "ASSET": "ASSET",
+    "UP": "UP BID/ASK",
+    "DOWN": "DOWN BID/ASK",
+    "LEAD": "LEAD",
+    "GAP": "GAP",
+}
+
+
+def _seg(text, color=None, bold=False, background=None):
+    return (str(text), color, background, bold)
+
+
+def _flatten(segments):
+    """Expand helpers that return segment lists (e.g. `_kpi`) inside a row."""
+    for segment in segments:
+        if isinstance(segment, list):
+            yield from _flatten(segment)
         else:
-            lines.append("| " + clipped + " |")
-    lines.append(colored("+" + "-" * (width - 2) + "+", color))
-    return "\n".join(lines)
+            yield segment
+
+
+def _width(segments):
+    return sum(len(segment[0]) for segment in _flatten(segments))
+
+
+def _fit(segments, width, align="left"):
+    """Clip or pad a segment list to exactly `width` visible characters."""
+    width = max(0, int(width))
+    fitted, used = [], 0
+    for text, color, background, bold in _flatten(segments):
+        if used >= width:
+            break
+        if not text:
+            continue
+        take = min(len(text), width - used)
+        fitted.append((text[:take], color, background, bold))
+        used += take
+    filler = width - used
+    if filler > 0:
+        pad = (" " * filler, None, None, False)
+        if align == "right":
+            fitted.insert(0, pad)
+        else:
+            fitted.append(pad)
+    return fitted
+
+
+def _paint(segments):
+    parts = []
+    for text, color, background, bold in segments:
+        if not text:
+            continue
+        if color or background or bold:
+            parts.append(
+                colored(text, color, background, attrs=["bold"] if bold else None)
+            )
+        else:
+            parts.append(text)
+    return "".join(parts)
+
+
+def _line(segments, width, align="left"):
+    return _paint(_fit(segments, width, align))
+
+
+def _trim(text, limit):
+    text = str(text)
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    tail = _G['ellipsis']
+    if limit <= len(tail):
+        return text[:limit]
+    return text[: limit - len(tail)] + tail
+
+
+def _clock(seconds):
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def _panel(title, rows, width, right=None):
+    """Boxed panel; every returned line is exactly `width` cells wide."""
+    inner = width - 2
+    border = C_BORDER
+    if right and len(right) > width // 2:
+        right = None
+    prefix_width = 2 + (len(title) + 1 if title else 0)
+    suffix_width = len(right) + 3 if right else 1
+    fills = inner - prefix_width - suffix_width
+    if fills < 1:
+        right = None
+        suffix_width = 1
+        fills = inner - prefix_width - suffix_width
+    if fills < 1:
+        title = _trim(title, max(0, inner - 4)) if title else title
+        prefix_width = 2 + (len(title) + 1 if title else 0)
+        fills = max(0, inner - prefix_width - suffix_width)
+
+    top = [_seg(_G['tl'], border)]
+    if title:
+        top += [_seg(_G['h'], border), _seg(" "), _seg(title, C_TITLE, bold=True), _seg(" ")]
+    else:
+        top.append(_seg(_G['h'], border))
+    top.append(_seg(_G['h'] * fills, border))
+    if right:
+        top += [_seg(" "), _seg(right, C_MUTED), _seg(" "), _seg(_G['h'], border)]
+    else:
+        top.append(_seg(_G['h'], border))
+    top.append(_seg(_G['tr'], border))
+
+    content = width - 4
+    lines = [_paint(top)]
+    for row in rows:
+        lines.append(_paint(
+            [_seg(_G['v'], border), _seg(" ")]
+            + _fit(row, content)
+            + [_seg(" "), _seg(_G['v'], border)]
+        ))
+    lines.append(_paint([
+        _seg(_G['bl'], border),
+        _seg(_G['h'] * inner, border),
+        _seg(_G['br'], border),
+    ]))
+    return lines
+
+
+def _split_row(left, right, width, gap=2):
+    """Left content plus a right-aligned tail, dropped whole when space is tight."""
+    if right:
+        left_width = _width(left)
+        right_width = _width(right)
+        if left_width + gap + right_width <= width:
+            return left + [_seg(" " * (width - left_width - right_width))] + right
+    return _fit(left, width)
+
+
+def _money(value):
+    return f"${value:.2f}"
+
+
+def _signed_money(value):
+    if abs(value) < 0.005:
+        return "$0.00"
+    return f"{'+' if value > 0 else '-'}${abs(value):.2f}"
+
+
+def _kpi(label, value, color=C_TEXT, bold=True):
+    return [_seg(label.upper() + " ", C_MUTED), _seg(value, color, bold=bold)]
+
+
+def _gauge(ratio, width, color):
+    ratio = max(0.0, min(1.0, ratio))
+    filled = int(round(ratio * width))
+    segments = [_seg(_G['fill'] * filled, color)]
+    if width > filled:
+        segments.append(_seg(_G['empty'] * (width - filled), C_MUTED))
+    return segments
+
+
+def _latency_color(value):
+    if value is None:
+        return C_MUTED
+    if value < 150:
+        return C_GOOD
+    if value < 400:
+        return C_TEXT
+    if value < 800:
+        return C_WARN
+    return C_BAD
+
+
+def _stats(bucket, lock):
+    with lock:
+        values = list(bucket)
+    if not values:
+        return None
+    ordered = sorted(values)
+    return {
+        'last': values[-1],
+        'avg': sum(values) / len(values),
+        'min': ordered[0],
+        'max': ordered[-1],
+        'p95': ordered[min(len(ordered) - 1, int(round(0.95 * (len(ordered) - 1))))],
+        'n': len(values),
+    }
+
+
+def _sparkline(samples, width):
+    blocks = _G['spark']
+    data = [float(value) for value in samples if value is not None][-width:]
+    if not data:
+        return [_seg(_G['dot'] * width, C_MUTED)]
+    low, high = min(data), max(data)
+    span = high - low
+    if span <= 1e-9:
+        indexes = [len(blocks) // 2] * len(data)
+    else:
+        indexes = [
+            int(round((value - low) / span * (len(blocks) - 1)))
+            for value in data
+        ]
+    return [_seg("".join(blocks[index] for index in indexes), C_ACCENT)]
 
 
 def draw_dashboard(market_states, market_books, time_left):
@@ -795,31 +1028,70 @@ def draw_dashboard(market_states, market_books, time_left):
     if not sys.stdout.isatty():
         return
 
+    render_started = time.perf_counter()
+    size = shutil.get_terminal_size((120, 40))
+    # Keep one column spare: writing the last cell of a row makes many terminals
+    # auto-wrap, which would push the whole dashboard down by a line.
+    width = min(118, max(24, size.columns - 1))
+    content_w = width - 4
+
     elapsed = max(0, int(time.time() - SESSION_START))
-    left = max(0, int(time_left)) if time_left is not None else MARKET_DURATION
     runtime = f"{elapsed // 3600:02d}:{(elapsed // 60) % 60:02d}:{elapsed % 60:02d}"
-    market_ts = next(iter(market_states.values())).get('market_ts') if market_states else get_current_market_timestamp()
+    left = (
+        max(0, min(MARKET_DURATION, int(time_left)))
+        if time_left is not None else MARKET_DURATION
+    )
+
+    first_state = next(iter(market_states.values()), None)
+    market_ts = (first_state or {}).get('market_ts') or get_current_market_timestamp()
     window_start = datetime.fromtimestamp(market_ts, ET).strftime("%H:%M:%S")
     window_end = datetime.fromtimestamp(market_ts + MARKET_DURATION, ET).strftime("%H:%M:%S")
+
     if left <= STOP_THRESHOLD_SEC:
-        phase, poll_interval = "CUTOFF - STANDING DOWN", 1.0
+        phase_label, phase_color, poll_interval = "CUTOFF / STANDING DOWN", C_BAD, 1.0
     elif left <= ENTRY_WINDOW_SEC:
-        phase, poll_interval = "SNIPE WINDOW ACTIVE", 1.0
+        phase_label, phase_color, poll_interval = "SNIPE WINDOW ACTIVE", C_GOOD, 1.0
     elif left <= ENTRY_WINDOW_SEC + 10:
-        phase, poll_interval = "PREPARING FAST POLL", 1.0
+        phase_label, phase_color, poll_interval = "ARMING FAST POLL", C_WARN, 1.0
     else:
-        phase, poll_interval = "WAITING FOR FINAL 60s", 3.0
-    progress = int(max(0, min(24, round((MARKET_DURATION - left) / MARKET_DURATION * 24))))
-    timer_bar = "#" * progress + "." * (24 - progress)
-    spinner = next(SPINNER_FRAMES)
+        phase_label, phase_color, poll_interval = "WAITING FOR FINAL 60s", C_MUTED, 3.0
+
+    to_cutoff = max(0, left - STOP_THRESHOLD_SEC)
+    countdown = _clock(to_cutoff)
+    if left <= STOP_THRESHOLD_SEC:
+        countdown_color = C_BAD
+    elif to_cutoff <= 15:
+        countdown_color = C_WARN
+    elif left <= ENTRY_WINDOW_SEC:
+        countdown_color = C_GOOD
+    else:
+        countdown_color = C_TEXT
+
+    if left > ENTRY_WINDOW_SEC:
+        entry_note = f"entry opens in {left - ENTRY_WINDOW_SEC}s"
+    elif left > STOP_THRESHOLD_SEC:
+        entry_note = f"entry closes in {to_cutoff}s"
+    else:
+        entry_note = "bids canceled, standing down"
+
     account = ACCOUNT_SUFFIX.lstrip("_") or "default"
     address = os.getenv(PUBLIC_KEY_ENV_NAME, "")
-    short_address = f"{address[:6]}..{address[-4:]}" if len(address) >= 12 else "unavailable"
-    mode = "DRY RUN" if DRY_RUN else "LIVE MAKER"
-    with _PING_LOCK:
-        ping = sum(CLOB_PING_MS) / len(CLOB_PING_MS) if CLOB_PING_MS else None
-    ping_text = f"{ping:.0f}ms ({'OK' if ping < 500 else 'SLOW'})" if ping is not None else "-- (waiting)"
+    short_address = f"{address[:6]}{_G['dot']}{_G['dot']}{address[-4:]}" if len(address) >= 12 else "unavailable"
+    spinner = _G['spinner'][next(_DASHBOARD_FRAME) % len(_G['spinner'])]
 
+    # ---- latency telemetry -------------------------------------------------
+    api = _stats(CLOB_PING_MS, _PING_LOCK)
+    ui = _stats(RENDER_LATENCY_MS, _LATENCY_LOCK)
+    with _PING_LOCK:
+        ping_samples = list(CLOB_PING_MS)
+    api_text = f"{api['avg']:.0f}ms" if api else "--"
+    api_color = _latency_color(api['avg'] if api else None)
+    ui_text = f"{ui['last']:.0f}ms" if ui else "--"
+    with _LATENCY_LOCK:
+        order_sample = ORDER_LATENCY_MS[-1] if ORDER_LATENCY_MS else None
+        cancel_sample = CANCEL_LATENCY_MS[-1] if CANCEL_LATENCY_MS else None
+
+    # ---- capital and risk --------------------------------------------------
     # Reservations include unfilled bids and filled shares. This split is for
     # display only; the exposure cap uses the same underlying reservation ledger.
     open_bid_cost = 0.0
@@ -837,120 +1109,487 @@ def draw_dashboard(market_states, market_books, time_left):
                 open_bid_shares += max(0.0, reserved - float(state.get('filled_cost') or 0.0)) / order_price
     total_exposure = _current_exposure_usd()
     other_reserved = max(0.0, total_exposure - open_bid_cost - filled_cost)
-    exposure_ratio = min(1.0, total_exposure / MAX_TOTAL_EXPOSURE_USD) if MAX_TOTAL_EXPOSURE_USD > 0 else 1.0
-    exposure_bar = "#" * round(exposure_ratio * 20) + "." * (20 - round(exposure_ratio * 20))
-    paper_resolved = SESSION_PAPER_WINS + SESSION_PAPER_LOSSES
-    paper_win_rate = SESSION_PAPER_WINS / paper_resolved * 100.0 if paper_resolved else 0.0
-    paper_result_rows = (
-        [
-            f"Paper close proxy: {SESSION_PAPER_WINS}W/{SESSION_PAPER_LOSSES}L | WR {paper_win_rate:.1f}% | PnL ${SESSION_PAPER_PNL:+.2f}",
-            "Outcome uses final cached book bids >= 0.98; this is not official market settlement.",
-        ]
-        if DRY_RUN else
-        ["Realized PnL / win rate unavailable until market settlement is tracked."]
+    limit = MAX_TOTAL_EXPOSURE_USD if MAX_TOTAL_EXPOSURE_USD > 0 else 0.0
+    exposure_ratio = min(1.0, total_exposure / limit) if limit else 1.0
+    free_capacity = max(0.0, limit - total_exposure)
+    exposure_color = (
+        C_BAD if exposure_ratio >= 0.9 else
+        C_WARN if exposure_ratio >= 0.7 else
+        C_GOOD
     )
-    rows = [
-        f"{spinner} POLYMARKET 5M 95c BID SNIPER v1.1 | ACCT: {account} ({short_address}) | MODE: {mode}",
-        f"UPTIME: {runtime} | POLL: {poll_interval:.1f}s ({'FAST' if poll_interval == 1.0 else 'SLOW'}) | CLOB PING: {ping_text} | LOG: sniper_session.log",
-        "=" * 100,
-        f"WINDOW: {window_start} -> {window_end} ET (id: {market_ts}) | PHASE: {phase}",
-        f"TIMER: [{timer_bar}] {left:03d}s left (Entry <= {ENTRY_WINDOW_SEC}s | Hard Cutoff @ {STOP_THRESHOLD_SEC:02d}s)",
-        "-" * 100,
-        "CAPITAL & RISK METRICS",
-        f"USDC Balance: unavailable | Window Exposure: ${total_exposure:.2f} / ${MAX_TOTAL_EXPOSURE_USD:.2f} [{exposure_bar}]",
-        f"KILL SWITCH: press 'k'/'q' in this terminal, or `echo > {KILL_SWITCH_FILE}` (env KILL_SWITCH=1). Cancels all open orders and exits.",
-        f"Open Bids: {open_bid_shares:.2f}sh (${open_bid_cost:.2f}) | Filled Holding: {filled_shares:.2f}sh (${filled_cost:.2f}) | Other Reserved: ${other_reserved:.2f}",
-        f"Est Payout: ${filled_shares:.2f} if all current filled shares resolve to $1",
-        *paper_result_rows,
-        "=" * 100,
-        "MULTI-CRYPTO SCANNER & EXECUTION MATRIX",
-        "ASSET | UP (BID / ASK) | DOWN (BID / ASK) | FAVORED / 95c GAP | EXECUTION STATUS",
-        "-" * 100,
+
+    # ---- header ------------------------------------------------------------
+    mode_badge = (
+        _seg(" LIVE MAKER ", "black", True, "on_light_red")
+        if not DRY_RUN else
+        _seg(" DRY RUN ", "black", True, "on_light_yellow")
+    )
+    tagline = [
+        _seg(f"last-{ENTRY_WINDOW_SEC}s maker", C_MUTED),
+        _seg(f" {_G['dot']} ", C_BORDER),
+        _seg(f"{MAX_BUY_PRICE * 100:.0f}{_G['cent']} cap", C_MUTED),
+        _seg(f" {_G['dot']} ", C_BORDER),
+        _seg(f"{len(CRYPTO_ASSETS)} assets", C_MUTED),
     ]
+    latency_bits = [
+        _kpi("poll", f"{poll_interval:.1f}s"),
+        _seg("  "),
+        _kpi("api", api_text, api_color),
+    ]
+    if ping_samples:
+        latency_bits += [_seg(" ")] + _sparkline(ping_samples, 8)
+    latency_bits += [
+        _seg("  "),
+        _kpi("ui", ui_text, _latency_color(ui['last'] if ui else None)),
+    ]
+    if order_sample is not None:
+        latency_bits += [_seg("  "), _kpi("ord", f"{order_sample:.0f}ms", _latency_color(order_sample))]
+    if cancel_sample is not None:
+        latency_bits += [_seg("  "), _kpi("cxl", f"{cancel_sample:.0f}ms", _latency_color(cancel_sample))]
+    if _width(tagline) + 2 + _width(latency_bits) > content_w:
+        # Prefer the core numbers over the sparkline and account-side timings.
+        latency_bits = [
+            _kpi("poll", f"{poll_interval:.1f}s"),
+            _seg("  "),
+            _kpi("api", api_text, api_color),
+            _seg("  "),
+            _kpi("ui", ui_text, _latency_color(ui['last'] if ui else None)),
+        ]
+
+    header_rows = [
+        _split_row(
+            [
+                _seg(spinner + " ", C_ACCENT, bold=True),
+                mode_badge,
+                _seg(" "),
+                _seg(account.upper(), C_TEXT, bold=True),
+                _seg(f" {_G['dot']} ", C_BORDER),
+                _seg(short_address, C_MUTED),
+            ],
+            [_kpi("uptime", runtime)],
+            content_w,
+        ),
+        _split_row(tagline, latency_bits, content_w),
+    ]
+
+    # ---- market window -----------------------------------------------------
+    progress = min(1.0, max(0.0, (MARKET_DURATION - left) / MARKET_DURATION))
+    bar_w = max(8, content_w - 7)
+    entry_ratio = (MARKET_DURATION - ENTRY_WINDOW_SEC) / MARKET_DURATION
+    cutoff_ratio = (MARKET_DURATION - STOP_THRESHOLD_SEC) / MARKET_DURATION
+    filled_cells = int(round(progress * bar_w))
+    accent_end = min(filled_cells, int(round(entry_ratio * bar_w)))
+    good_end = min(filled_cells, int(round(cutoff_ratio * bar_w)))
+    bar_segments = [_seg("[", C_BORDER)]
+    if accent_end:
+        bar_segments.append(_seg(_G['fill'] * accent_end, C_ACCENT))
+    if good_end > accent_end:
+        bar_segments.append(_seg(_G['fill'] * (good_end - accent_end), C_GOOD))
+    if filled_cells > good_end:
+        bar_segments.append(_seg(_G['fill'] * (filled_cells - good_end), C_BAD))
+    if bar_w > filled_cells:
+        bar_segments.append(_seg(_G['empty'] * (bar_w - filled_cells), C_MUTED))
+    bar_segments.append(_seg("]", C_BORDER))
+    bar_segments.append(_seg(f" {progress * 100:3.0f}%", C_TEXT, bold=True))
+
+    timer_left = [
+        _seg(countdown, countdown_color, bold=True),
+        _seg("  to cutoff", C_MUTED),
+        _seg("   "),
+        _seg(phase_label, phase_color, bold=True),
+    ]
+    timer_right = [_seg(entry_note, C_MUTED)]
+    if _width(timer_left) + 2 + _width(timer_right) > content_w:
+        # Narrow terminal: shorten the phase wording before clipping it.
+        short_phase = {
+            "CUTOFF / STANDING DOWN": "CUTOFF",
+            "SNIPE WINDOW ACTIVE": "SNIPING",
+            "ARMING FAST POLL": "ARMING",
+            "WAITING FOR FINAL 60s": "WAITING",
+        }
+        timer_left = [
+            _seg(countdown, countdown_color, bold=True),
+            _seg("  "),
+            _seg(short_phase.get(phase_label, phase_label), phase_color, bold=True),
+        ]
+        timer_right = [_seg(f"{left}s left", C_MUTED)]
+    timer_rows = [
+        _split_row(timer_left, timer_right, content_w),
+        _split_row(bar_segments, [_kpi("id", market_ts)], content_w),
+    ]
+
+    # ---- risk rows ---------------------------------------------------------
+    gauge_w = 12 if content_w >= 76 else 8 if content_w >= 52 else 0
+    risk_row_1_left = _kpi("exposure", f"${total_exposure:.2f} / ${limit:.2f}")
+    if gauge_w:
+        risk_row_1_left += [_seg("  ")] + _gauge(exposure_ratio, gauge_w, exposure_color)
+        risk_row_1_left += [_seg(f" {exposure_ratio * 100:3.0f}%", exposure_color, bold=True)]
+    else:
+        risk_row_1_left += [_seg("  "), _seg(f"{exposure_ratio * 100:.0f}%", exposure_color, bold=True)]
+    risk_row_1_right = [
+        _kpi("free", f"${free_capacity:.2f}", C_GOOD if free_capacity > 0 else C_MUTED),
+        _seg("  " + _G['dot'] + "  ", C_BORDER),
+        _kpi("roi/fill", f"+{TARGET_GAIN_PCT:.2f}%", C_GOOD),
+    ]
+    if _width(risk_row_1_left) + 2 + _width(risk_row_1_right) > content_w:
+        risk_row_1_right = risk_row_1_right[:1]
+    risk_row_1 = _split_row(risk_row_1_left, risk_row_1_right, content_w)
+    risk_chunks = [
+        _kpi("open", f"{open_bid_shares:.2f}sh")
+        + [_seg(f" ({_money(open_bid_cost)})", C_MUTED)],
+        _kpi("holding", f"{filled_shares:.2f}sh")
+        + [_seg(f" ({_money(filled_cost)})", C_MUTED)],
+        _kpi("payout", f"${filled_shares:.2f}"),
+    ]
+    if other_reserved > 0.005:
+        risk_chunks.append(_kpi("reserved", _money(other_reserved), C_WARN))
+    # Keep chunks whole: on narrow terminals drop the least useful tail rather
+    # than slicing a figure in half.
+    risk_row_2_left = []
+    for chunk in risk_chunks:
+        separator = 4 if risk_row_2_left else 0
+        if separator and _width(risk_row_2_left) + separator + _width(chunk) > content_w:
+            break
+        if separator:
+            risk_row_2_left.append(_seg(" " * separator))
+        risk_row_2_left += chunk
+    loss_value = _signed_money(-filled_cost)
+    profit_value = _signed_money(max(0.0, filled_shares - filled_cost))
+    loss_color = C_BAD if filled_cost else C_MUTED
+    profit_color = C_GOOD if filled_shares > filled_cost else C_MUTED
+    loss_profit_variants = [
+        [
+            _kpi("max loss", loss_value, loss_color),
+            _seg("  " + _G['dot'] + "  ", C_BORDER),
+            _kpi("max profit", profit_value, profit_color),
+        ],
+        [
+            _kpi("loss", loss_value, loss_color),
+            _seg("  " + _G['dot'] + "  ", C_BORDER),
+            _kpi("profit", profit_value, profit_color),
+        ],
+        [
+            _kpi("loss", loss_value, loss_color),
+            _seg(" / ", C_BORDER),
+            _kpi("gain", profit_value, profit_color),
+        ],
+    ]
+    loss_profit_bits = next(
+        (variant for variant in loss_profit_variants if _width(variant) <= content_w),
+        loss_profit_variants[-1],
+    )
+    if _width(risk_row_2_left) + 2 + _width(loss_profit_bits) <= content_w:
+        risk_rows = [risk_row_1, _split_row(risk_row_2_left, loss_profit_bits, content_w)]
+    else:
+        risk_rows = [
+            risk_row_1,
+            _fit(risk_row_2_left, content_w),
+            _fit(loss_profit_bits, content_w),
+        ]
+
+    # ---- scanner -----------------------------------------------------------
+    # The five-column table needs ~56 visible cells plus room for a status
+    # message, so drop LEAD/GAP only below that.
+    compact = width < 76
+    gap = 1 if compact else 2
+    quote_sep = "" if compact else " "
+    quote_width = 12 if compact else 13
+    columns = (
+        [("ASSET", 5), ("UP", quote_width), ("DOWN", quote_width), ("LEAD", 6), ("GAP", 9)]
+        if not compact else
+        [("ASSET", 6), ("UP", quote_width), ("DOWN", quote_width)]
+    )
+    while columns and content_w - sum(w for _, w in columns) - gap * len(columns) < 10:
+        columns = columns[:-1]
+    status_w = max(
+        8,
+        content_w - sum(w for _, w in columns) - gap * len(columns),
+    )
+
+    def table_row(cells, status):
+        segments = []
+        for key, col_width in columns:
+            text, color, bold = cells.get(key, ("", C_MUTED, False))
+            segments.append(_seg(_trim(text, col_width).ljust(col_width), color, bold))
+            segments.append(_seg(" " * gap))
+        segments.append(_seg(_trim(status[0], status_w).ljust(status_w), status[1]))
+        return segments
+
+    headers = dict(SCANNER_HEADERS)
+    scanner_rows = [table_row(
+        {key: (headers[key], C_MUTED, True) for key, _ in columns},
+        ("EXECUTION", C_MUTED),
+    ), [_seg(_G['h'] * content_w, C_BORDER)]]
+
+    def side_quote(bid, ask):
+        bid_text = f"{bid:.3f}" if bid is not None else "---"
+        ask_text = f"{ask:.3f}" if ask is not None else "---"
+        return f"{bid_text}{quote_sep}/{quote_sep}{ask_text}"
+
     for symbol in CRYPTO_ASSETS:
-        market_state = market_states.get(symbol)
-        if not market_state:
-            rows.append(f"{symbol:<5} | --- / ---       | --- / ---         | unavailable       | market discovery pending")
-            continue
+        state = market_states.get(symbol)
         up_book, down_book = market_books.get(symbol, (None, None))
-        def quote(book):
-            if not book:
-                return "---", "---"
-            bid, ask = book.get('best_bid'), book.get('best_ask')
-            return f"{bid:.3f}" if bid is not None else "---", f"{ask:.3f}" if ask is not None else "---"
-        up_bid, up_ask = quote(up_book)
-        down_bid, down_ask = quote(down_book)
-        available_asks = [(up_book or {}).get('best_ask'), (down_book or {}).get('best_ask')]
-        sides = [("UP", available_asks[0]), ("DOWN", available_asks[1])]
-        leading_side, leading_ask = max(
-            ((side, ask) for side, ask in sides if ask is not None),
-            key=lambda pair: pair[1], default=(None, None),
-        )
+        up_bid = up_book.get('best_bid') if up_book else None
+        up_ask = up_book.get('best_ask') if up_book else None
+        down_bid = down_book.get('best_bid') if down_book else None
+        down_ask = down_book.get('best_ask') if down_book else None
+        up_text = side_quote(up_bid, up_ask)
+        down_text = side_quote(down_bid, down_ask)
+
         qualified_side, _ = pick_decided_side(up_book, down_book)
-        signal_side = qualified_side or leading_side
-        signal_ask = available_asks[0] if signal_side == "UP" else available_asks[1]
-        decided = qualified_side is not None
-        if decided:
-            gap_text = f"{signal_side} [DECIDED +{(signal_ask - ENTRY_THRESHOLD) * 100:.0f}c]"
-        elif leading_ask is not None and leading_ask >= ENTRY_THRESHOLD:
-            gap_text = f"{leading_side} [FILTERED]"
-        elif leading_ask is not None:
-            gap_text = f"{leading_side} ({(ENTRY_THRESHOLD - leading_ask) * 100:.1f}c away)"
-        else:
-            gap_text = "no asks / unavailable"
-
-        if market_state.get('entered'):
-            status_text = f"HOLD {market_state.get('filled_shares', 0):.2f}sh @ ${market_state.get('entry_fill_price') or 0:.3f}"
-        elif market_state.get('last_order_id'):
-            kind = "SIM BID" if DRY_RUN else "LIVE BID"
-            status_text = f"{kind} {market_state.get('last_order_price') or 0:.3f}"
-        else:
-            status_text = "WATCHING"
-            if decided:
-                try:
-                    favored_book = up_book if signal_side == "UP" else down_book
-                    opposite_book = down_book if signal_side == "UP" else up_book
-                    price = compute_bid_target(favored_book, left, opposite_book)
-                    shares = calculate_shares(BET_SIZE_USD, price) if price else 0.0
-                    order_cost = price * shares if price else 0.0
-                    if total_exposure + order_cost > MAX_TOTAL_EXPOSURE_USD:
-                        status_text = f"CAPPED (${total_exposure:.2f}/${MAX_TOTAL_EXPOSURE_USD:.2f})"
-                    elif price:
-                        status_text = f"SIGNAL / BID {price:.3f}"
-                except (TypeError, ValueError):
-                    pass
-            elif leading_ask is None:
-                status_text = "NO BOOK / UNDECIDED"
-            elif leading_ask >= ENTRY_THRESHOLD:
-                status_text = "FILTERED / THIN OR OPPOSING BID"
-            elif leading_ask < ENTRY_THRESHOLD:
-                status_text = "CHOP / UNDECIDED"
-        rows.append(
-            f"{symbol:<5} | {up_bid} / {up_ask}       | {down_bid} / {down_ask}         | {gap_text:<19} | {status_text}"
+        leading_side, leading_ask = max(
+            (
+                (side, ask)
+                for side, ask in (("UP", up_ask), ("DOWN", down_ask))
+                if ask is not None
+            ),
+            key=lambda pair: pair[1],
+            default=(None, None),
         )
-    fill_rate = (SESSION_ENTRIES / SESSION_SIGNALS * 100.0) if SESSION_SIGNALS else 0.0
-    rows.extend([
-        "=" * 100,
-        "SESSION TELEMETRY",
-        f"Windows Seen: {SESSION_WINDOWS:<4} Signals (>=95c): {SESSION_SIGNALS:<4} Order Attempts: {SESSION_ATTEMPTS:<4} Reprices: {SESSION_REPRICES}",
-        f"Fills: {SESSION_ENTRIES:<4} Fill Rate: {fill_rate:5.1f}% Cutoff Cancels: {SESSION_CUTOFF_CANCELS:<4} Timeouts: {SESSION_TIMEOUTS}",
-        "-" * 100,
-        "ORDER & EXECUTION LOG (persistent in sniper_session.log; last 5 shown)",
-    ])
-    if ORDER_LOG:
-        rows.extend(f"{ts}  {msg}" for ts, msg, _ in ORDER_LOG)
-    else:
-        rows.append("No order actions yet.")
-    rows.extend(["-" * 100, "SYSTEM & DISCOVERY LOG"])
-    if EVENT_LOG:
-        rows.extend(f"{ts}  {msg}" for ts, msg, _ in EVENT_LOG)
-    else:
-        rows.append("Starting up; waiting for market data.")
+        signal_side = qualified_side or leading_side
+        signal_ask = up_ask if signal_side == "UP" else down_ask if signal_side == "DOWN" else None
+        if state is None:
+            scanner_rows.append(table_row(
+                {
+                    "ASSET": (symbol, C_TEXT, True),
+                    "UP": (up_text, C_MUTED, False),
+                    "DOWN": (down_text, C_MUTED, False),
+                    "LEAD": ("--", C_MUTED, False),
+                    "GAP": ("--", C_MUTED, False),
+                },
+                ("discovery pending", C_MUTED),
+            ))
+            continue
 
-    footer = "[Ctrl+C] Safe shutdown: cancel live bids in parallel before exit" if not DRY_RUN else "[Ctrl+C] Safe shutdown: clear simulated bids; dry-run state is memory only"
-    color = "yellow" if left <= ENTRY_WINDOW_SEC else "green"
-    frame_text = _draw_panel("POLYMARKET 5-MINUTE BID SNIPER", rows)
-    frame_text += "\n" + colored(footer, color)
+        if qualified_side:
+            up_color = C_GOOD if qualified_side == "UP" else C_TEXT
+            down_color = C_GOOD if qualified_side == "DOWN" else C_TEXT
+            lead_color = C_GOOD
+        elif up_book or down_book:
+            up_color = C_TEXT if up_book else C_MUTED
+            down_color = C_TEXT if down_book else C_MUTED
+            lead_color = C_WARN if leading_ask is not None and leading_ask >= ENTRY_THRESHOLD else C_TEXT
+        else:
+            up_color = down_color = lead_color = C_MUTED
+
+        age = None
+        if state.get('favored_side') and state.get('favored_since'):
+            age = max(0, int(time.time() - state['favored_since']))
+        if qualified_side:
+            gap_text = f"+{max(0.0, (signal_ask - ENTRY_THRESHOLD) * 100):.1f}{_G['cent']}"
+            if age is not None:
+                gap_text += f" {age}s"
+            gap_color = C_GOOD
+        elif leading_ask is not None and leading_ask >= ENTRY_THRESHOLD:
+            gap_text, gap_color = "FILTERED", C_WARN
+        elif leading_ask is not None:
+            gap_text = f"-{(ENTRY_THRESHOLD - leading_ask) * 100:.1f}{_G['cent']}"
+            gap_color = C_MUTED
+        else:
+            gap_text, gap_color = "--", C_MUTED
+
+        if state.get('entered'):
+            status = (
+                f"HOLD {float(state.get('filled_shares') or 0):.2f}sh "
+                f"@ {float(state.get('entry_fill_price') or 0):.3f}",
+                C_GOOD,
+            )
+        elif state.get('last_order_id'):
+            kind = "SIM BID" if DRY_RUN else "LIVE BID"
+            status = (f"{kind} {float(state.get('last_order_price') or 0):.3f}", C_ACCENT)
+        elif qualified_side:
+            try:
+                favored_book = up_book if qualified_side == "UP" else down_book
+                opposite_book = down_book if qualified_side == "UP" else up_book
+                target = compute_bid_target(favored_book, left, opposite_book)
+                if target is None:
+                    status = ("SIGNAL / NO BID", C_WARN)
+                else:
+                    shares = calculate_shares(BET_SIZE_USD, target)
+                    if total_exposure + target * shares > MAX_TOTAL_EXPOSURE_USD:
+                        status = ("SIGNAL / CAPPED", C_WARN)
+                    else:
+                        edge = shares * (1.0 - target)
+                        status = (f"BID {target:.3f} {_G['dot']} +${edge:.2f}", C_GOOD)
+            except (TypeError, ValueError, KeyError):
+                status = ("SIGNAL", C_GOOD)
+        elif state.get('sharp_ask_drop', {}).get(state.get('favored_side')):
+            status = ("ARMED / 2c ASK DROP", C_WARN)
+        elif leading_ask is None:
+            status = ("NO BOOK", C_MUTED)
+        elif leading_ask >= ENTRY_THRESHOLD:
+            status = ("FILTERED / THIN BOOK", C_WARN)
+        else:
+            status = (
+                f"CHOP / {(ENTRY_THRESHOLD - leading_ask) * 100:.1f}{_G['cent']} AWAY",
+                C_MUTED,
+            )
+
+        scanner_rows.append(table_row(
+            {
+                "ASSET": (symbol, C_TEXT, True),
+                "UP": (up_text, up_color, False),
+                "DOWN": (down_text, down_color, False),
+                "LEAD": (leading_side or "--", lead_color, True),
+                "GAP": (gap_text, gap_color, False),
+            },
+            status,
+        ))
+
+    # ---- session telemetry -------------------------------------------------
+    fill_rate = (SESSION_ENTRIES / SESSION_SIGNALS * 100.0) if SESSION_SIGNALS else 0.0
+    if DRY_RUN:
+        resolved = SESSION_PAPER_WINS + SESSION_PAPER_LOSSES
+        win_rate = (SESSION_PAPER_WINS / resolved * 100.0) if resolved else 0.0
+        result_bits = [
+            _kpi("paper", f"{SESSION_PAPER_WINS}W/{SESSION_PAPER_LOSSES}L"),
+            _seg("  "),
+            _kpi("wr", f"{win_rate:.0f}%", C_GOOD if win_rate >= 50 else C_TEXT),
+            _seg("  "),
+            _kpi("pnl", _signed_money(SESSION_PAPER_PNL),
+                 C_GOOD if SESSION_PAPER_PNL > 0 else C_BAD if SESSION_PAPER_PNL < 0 else C_TEXT),
+        ]
+    else:
+        result_bits = [_seg("settlement not tracked yet", C_MUTED)]
+
+    telemetry_rows = [
+        _fit([
+            _kpi("windows", SESSION_WINDOWS),
+            _seg("   "),
+            _kpi("signals", SESSION_SIGNALS, C_ACCENT if SESSION_SIGNALS else C_TEXT),
+            _seg("   "),
+            _kpi("fills", SESSION_ENTRIES, C_GOOD if SESSION_ENTRIES else C_TEXT),
+            _seg("   "),
+            _kpi("fill rate", f"{fill_rate:.0f}%", C_GOOD if fill_rate >= 50 else C_TEXT),
+            _seg("   "),
+            _kpi("attempts", SESSION_ATTEMPTS),
+            _seg("   "),
+            _kpi("reprices", SESSION_REPRICES),
+        ], content_w),
+        _split_row(
+            result_bits,
+            [
+                _kpi("timeouts", SESSION_TIMEOUTS, C_BAD if SESSION_TIMEOUTS else C_TEXT),
+                _seg("   "),
+                _kpi("cutoff cancels", SESSION_CUTOFF_CANCELS),
+                _seg("   "),
+                _kpi("skips", SESSION_SKIPS),
+            ],
+            content_w,
+        ),
+    ]
+
+    # ---- logs --------------------------------------------------------------
+    log_limit = 4 if size.lines >= 42 else 3 if size.lines >= 36 else 2 if size.lines >= 30 else 1
+    severity_colors = {
+        "green": C_GOOD, "yellow": C_WARN, "red": C_BAD,
+        "cyan": C_ACCENT, "white": C_TEXT,
+    }
+
+    def log_rows(entries, limit):
+        rows = []
+        for ts, message, color in list(entries)[-limit:]:
+            rows.append([
+                _seg(ts + " ", C_MUTED),
+                _seg(_G['v'] + " ", severity_colors.get(color, C_MUTED)),
+                _seg(_trim(message, content_w - 12), C_TEXT),
+            ])
+        if not rows:
+            rows.append([_seg("waiting for events", C_MUTED)])
+        while len(rows) < limit:
+            rows.append([])
+        return rows
+
+    frame_lines = []
+    header_panel = _panel("POLYMARKET 5M BID SNIPER", header_rows, width, right="v1.1")
+    market_panel = _panel(
+        "MARKET WINDOW", timer_rows, width,
+        right=f"{window_start} {_G['arrow']} {window_end} ET",
+    )
+    risk_panel = _panel("CAPITAL & RISK", risk_rows, width)
+    scanner_panel = _panel(
+        "SCANNER", scanner_rows, width,
+        right=f"{len(market_states)}/{len(CRYPTO_ASSETS)} markets",
+    )
+    telemetry_panel = _panel(
+        "SESSION TELEMETRY", telemetry_rows, width,
+        right="paper proxy" if DRY_RUN else "live",
+    )
+
+    budget = max(12, size.lines)
+    frame_lines = header_panel + market_panel + risk_panel + scanner_panel
+    # Fill the remaining rows with secondary panels and shrink the logs to the
+    # space that is actually left, so a shorter terminal never scrolls the
+    # dashboard and never loses a whole panel just because its full height
+    # does not fit.
+    room = budget - 1 - len(frame_lines)
+    if len(telemetry_panel) <= room:
+        frame_lines += telemetry_panel
+        room -= len(telemetry_panel)
+    for title, entries, right in (
+        ("EXECUTION LOG", ORDER_LOG, "sniper_session.log"),
+        ("SYSTEM & DISCOVERY", EVENT_LOG, None),
+    ):
+        rows_wanted = min(log_limit, room - 2)
+        if rows_wanted < 1:
+            continue
+        panel = _panel(title, log_rows(entries, rows_wanted), width, right=right)
+        if len(panel) <= room:
+            frame_lines += panel
+            room -= len(panel)
+    if len(frame_lines) + 1 > budget:
+        # Very short terminal: keep the headline risk figures and shed scanner
+        # rows from the bottom instead of losing the capital panel entirely.
+        risk_headline = _panel(
+            "CAPITAL & RISK",
+            [risk_row_1, _fit(loss_profit_bits, content_w)],
+            width,
+        )
+        kept = len(scanner_rows)
+        trimmed_panel = scanner_panel
+        while kept > 3:
+            if (
+                len(header_panel) + len(market_panel)
+                + len(risk_headline) + len(trimmed_panel) + 1 <= budget
+            ):
+                break
+            kept -= 1
+            trimmed_panel = _panel(
+                "SCANNER", scanner_rows[:kept], width,
+                right=f"{len(market_states)}/{len(CRYPTO_ASSETS)} markets",
+            )
+        frame_lines = header_panel + market_panel + risk_headline + trimmed_panel
+    if len(frame_lines) + 1 > budget:
+        frame_lines = header_panel + market_panel + scanner_panel
+
+    footer_left = [
+        _seg("k", C_TEXT, bold=True), _seg(" / ", C_BORDER), _seg("q", C_TEXT, bold=True),
+        _seg("  kill switch", C_MUTED),
+        _seg(f" {_G['dot']} ", C_BORDER),
+        _seg("ctrl+c", C_TEXT, bold=True), _seg("  safe shutdown", C_MUTED),
+    ]
+    footer_right = [
+        _seg(
+            "dry-run state is memory only" if DRY_RUN
+            else "cancels live orders before exit",
+            C_MUTED,
+        )
+    ]
+    if _width(footer_left) + 2 + _width(footer_right) > width:
+        footer_left = [
+            _seg("k", C_TEXT, bold=True), _seg("/", C_BORDER), _seg("q", C_TEXT, bold=True),
+            _seg("  kill", C_MUTED),
+            _seg(f" {_G['dot']} ", C_BORDER),
+            _seg("ctrl+c", C_TEXT, bold=True), _seg("  exit", C_MUTED),
+        ]
+    if len(frame_lines) < budget:
+        frame_lines.append(_line(_split_row(footer_left, footer_right, width), width))
+
+    duration_ms = (time.perf_counter() - render_started) * 1000.0
+    with _LATENCY_LOCK:
+        RENDER_LATENCY_MS.append(duration_ms)
+
+    frame_text = "\n".join(frame_lines)
     if DASHBOARD_RENDERED:
         sys.stdout.write("\033[H" + frame_text + "\033[J")
     else:
@@ -962,21 +1601,56 @@ def draw_dashboard(market_states, market_books, time_left):
 
 def draw_scoreboard(market_states):
     """Print a compact session summary when the bot stops."""
+    columns = shutil.get_terminal_size((90, 24)).columns
+    width = max(48, min(76, columns - 1))
+    content_w = width - 4
     elapsed = max(0, int(time.time() - SESSION_START))
     runtime = f"{elapsed // 3600:02d}:{(elapsed // 60) % 60:02d}:{elapsed % 60:02d}"
-    print(colored("\nSESSION SCOREBOARD", "cyan", attrs=["bold"]))
-    print(colored("-" * 40, "cyan"))
-    print(f"Runtime:          {runtime}")
-    print(f"Filled entries:   {SESSION_ENTRIES}")
-    print(f"Order attempts:   {SESSION_ATTEMPTS}")
-    print(f"No-signal checks: {SESSION_SKIPS}")
+    result = (
+        f"{SESSION_PAPER_WINS}W/{SESSION_PAPER_LOSSES}L · PnL {_signed_money(SESSION_PAPER_PNL)} (paper proxy)"
+        if DRY_RUN else "settlement not tracked"
+    )
+    rows = [
+        _split_row(_kpi("runtime", runtime), [_seg(result, C_MUTED)], content_w),
+        _split_row(
+            _kpi("fills", SESSION_ENTRIES, C_GOOD if SESSION_ENTRIES else C_TEXT)
+            + [_seg("   ")]
+            + _kpi("attempts", SESSION_ATTEMPTS)
+            + [_seg("   ")]
+            + _kpi("skips", SESSION_SKIPS),
+            [],
+            content_w,
+        ),
+    ]
     for symbol, market_state in market_states.items():
         if market_state.get('entered'):
-            print(f"{symbol} held {market_state.get('favored_side')} @ ${market_state.get('entry_fill_price') or 0:.3f}")
+            side = str(market_state.get('favored_side') or '')
+            rows.append(_split_row(
+                [
+                    _seg(symbol, C_TEXT, bold=True),
+                    _seg("  holding ", C_MUTED),
+                    _seg(side, C_GOOD, bold=True),
+                    _seg(" "),
+                    _seg(f"{float(market_state.get('filled_shares') or 0):.2f}sh", C_TEXT, bold=True),
+                    _seg(" @ ", C_MUTED),
+                    _seg(f"{float(market_state.get('entry_fill_price') or 0):.3f}", C_TEXT),
+                ],
+                [],
+                content_w,
+            ))
         elif market_state.get('last_order_id'):
-            suffix = "simulated order remains in memory" if DRY_RUN else "verify/cancel on Polymarket"
-            print(colored(f"{symbol}: open order {suffix}", "yellow"))
-    print(colored("-" * 40, "cyan"))
+            rows.append([
+                _seg(symbol, C_TEXT, bold=True),
+                _seg(
+                    "  open order remains, verify on Polymarket" if not DRY_RUN
+                    else "  simulated order remains in memory",
+                    C_WARN,
+                ),
+            ])
+    print()
+    for line in _panel("SESSION SCOREBOARD", rows, width, right="closed"):
+        print(line)
+    print()
 
 
 def _cancel_and_confirm(token_id, order_id, wait_sec=0.6, exposure_key=None):
@@ -1469,7 +2143,9 @@ def main():
                     if not market_state.get('signal_counted'):
                         SESSION_SIGNALS += 1
                         market_state['signal_counted'] = True
-                    market_state['favored_side'] = side
+                    if market_state.get('favored_side') != side:
+                        market_state['favored_side'] = side
+                        market_state['favored_since'] = time.time()
                     token_key = 'up_token_id' if side == "UP" else 'down_token_id'
                     market_state['favored_token_id'] = market_state['market_info'][token_key]
                     log_event(f"{symbol} {side} crossed the decided threshold", "green")
