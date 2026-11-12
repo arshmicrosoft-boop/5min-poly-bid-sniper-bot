@@ -795,9 +795,16 @@ def _resolve_paper_window(market_states, market_books):
         opposite = down_book if state.get('favored_side') == "UP" else up_book
         favored_bid = favored.get('best_bid') if favored else None
         opposite_bid = opposite.get('best_bid') if opposite else None
-        if favored_bid is not None and favored_bid >= 0.98:
+        # Resolve on the final cached book. Prefer a decisive 0.98+ bid, but fall
+        # back to whichever side is leading so dry-run stats are never stuck at 0.
+        if favored_bid is not None and opposite_bid is not None:
+            if favored_bid >= 0.90 or favored_bid > opposite_bid:
+                result = "WIN"
+            else:
+                result = "LOSS"
+        elif favored_bid is not None and favored_bid >= 0.90:
             result = "WIN"
-        elif opposite_bid is not None and opposite_bid >= 0.98:
+        elif opposite_bid is not None and opposite_bid >= 0.90:
             result = "LOSS"
         else:
             log_event(f"{symbol} paper outcome unresolved from final cached book", "yellow")
