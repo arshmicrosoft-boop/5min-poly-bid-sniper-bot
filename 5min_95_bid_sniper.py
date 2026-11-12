@@ -1398,12 +1398,18 @@ def draw_dashboard(market_states, market_books, time_left):
         if separator:
             risk_row_2_left.append(_seg(" " * separator))
         risk_row_2_left += chunk
+    # Max loss/profit reflect current exposure (resting + filled) so they are
+    # accurate and non-zero while orders are live, not only after resolution.
+    total_cost = open_bid_cost + filled_cost
+    total_shares = open_bid_shares + filled_shares
     if DRY_RUN:
-        loss_value = _signed_money(-SESSION_PAPER_MAX_LOSS)
-        profit_value = _signed_money(SESSION_PAPER_MAX_PROFIT)
+        reserve = total_cost * DRY_RUN_FEE_RATE + DRY_RUN_SLIPPAGE * total_shares
     else:
-        loss_value = _signed_money(-filled_cost)
-        profit_value = _signed_money(max(0.0, filled_shares - filled_cost))
+        reserve = 0.0
+    max_loss_val = total_cost + reserve
+    max_profit_val = max(0.0, total_shares * 1.0 - total_cost - reserve)
+    loss_value = _signed_money(-max_loss_val)
+    profit_value = _signed_money(max_profit_val)
     loss_color = C_BAD if filled_cost else C_MUTED
     profit_color = C_GOOD if filled_shares > filled_cost else C_MUTED
     loss_profit_variants = [
