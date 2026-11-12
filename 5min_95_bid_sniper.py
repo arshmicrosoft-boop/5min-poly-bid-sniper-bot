@@ -917,6 +917,7 @@ def _validate_configuration():
 def _resolve_paper_window(market_states, market_books):
     """Estimate paper outcomes from the final cached book, not official settlement."""
     global SESSION_PAPER_WINS, SESSION_PAPER_LOSSES, SESSION_PAPER_PNL, SESSION_PAPER_PEAK_PNL, SESSION_MAX_DD, SESSION_CURRENT_STREAK
+    global SESSION_PAPER_MAX_LOSS, SESSION_PAPER_MAX_PROFIT
     if not DRY_RUN:
         return
     for symbol, state in market_states.items():
