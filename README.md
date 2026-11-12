@@ -1,10 +1,10 @@
 # Polymarket 95-Cent Bid Sniper
 
-A Python command-line bot for BTC 5-minute UP/DOWN markets on Polymarket. It follows the patient, post-only maker strategy described in the [Moon Dev walkthrough](https://moondev.com/polymarket-95-cent-bid-sniper). The local project includes the dashboard, main loop, and helper module needed to run the strategy.
+A Python command-line bot for Polymarket 5-minute crypto UP/DOWN markets. It scans BTC, ETH, SOL, XRP, and DOGE markets for the patient, post-only maker strategy described in the [Moon Dev walkthrough](https://moondev.com/polymarket-95-cent-bid-sniper). The local project includes the dashboard, main loop, and helper module needed to run the strategy.
 
 ## How the strategy works
 
-The bot waits until the final 60 seconds of a five-minute market, then looks for an outcome whose best ask is at least `$0.95`. If one qualifies, it proposes a post-only BUY limit order at the best bid, capped at `$0.95`. It checks the book about every three seconds and stops entering at five seconds remaining. It tracks at most one entry per market.
+For each listed coin market, the bot waits until the final 60 seconds, then looks for an outcome whose best ask is at least `$0.95`. If one qualifies, it proposes a post-only BUY limit order at the best bid, capped at `$0.95`. It polls the coin books concurrently, checks orders about every three seconds, and stops entering at five seconds remaining. Each coin has independent signal and order state, with at most one entry per coin per window. A coin market that is not listed or cannot be fetched is skipped and rediscovered periodically.
 
 At a `$0.95` purchase price, a share that resolves to `$1.00` has a gross price gain of about 5.26% on the amount paid, before fees and other costs. This is not a return guarantee. Polymarket's five-share minimum means the default `$1.00` target can require about `$4.75` at the price cap.
 
@@ -16,7 +16,7 @@ At a `$0.95` purchase price, a share that resolves to `$1.00` has a gross price 
 |-- .gitignore
 |-- requirements.txt
 |-- 5min_95_bid_sniper.py
-|-- backtest.py
+|-- backtest/
 `-- nice_funcs.py
 ```
 
@@ -79,6 +79,8 @@ To enable live order submission, set `DRY_RUN=false` in `.env` and configure val
 | Entry window | Final 60 seconds |
 | Stop/cancel threshold | 5 seconds remaining |
 | Order recheck interval | 3 seconds |
+
+The bot can place a separate order for each qualifying coin in the same window. At the five-share minimum, five concurrent entries at `$0.95` could require up to `$23.75` before fees. There is no global portfolio exposure cap.
 
 ## Order-state handling
 

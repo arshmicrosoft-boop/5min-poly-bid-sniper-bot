@@ -47,39 +47,39 @@ def run_strike_cross(days=30):
     return {"trades":trades,"wins":wins,"wr":wr,"net":net,"details":details}
 
 
-def run_95cent(days=30):
+def run_95cent(days=30, fill_rate=0.7, seed=41):
+    import random
+    rng = random.Random(seed)
     windows = build_real_windows_from_binance(num_days=days)
     THRESH = 0.95
     SHARES = 5.0
     trades=0; wins=0; net=0.0; details=[]
     for w in windows:
-        # use last available snapshot (180s) as proxy for "decided" late window
-        snap = None
-        for s in w["snapshots"]:
-            if s["elapsed"] >= 120:
-                snap = s
-        if snap is None and w["snapshots"]:
-            snap = w["snapshots"][-1]
-        if snap is None:
+        # only consider snapshots in the final 60 seconds
+        late_snaps = [s for s in w["snapshots"] if s["remaining"] <= 60]
+        if not late_snaps:
             continue
+        snap = late_snaps[-1]
         remaining = snap["remaining"]
-        if remaining > 60:  # only last 60s
-            # approximate: still check decidedness at 180s proxy
-            pass
+        if remaining > 60:
+            continue
         for side in ("UP","DOWN"):
             ask = snap["up_ask"] if side=="UP" else snap["down_ask"]
             bid = snap["up_bid"] if side=="UP" else snap["down_bid"]
             if ask >= THRESH:
+                # model passive fill: not guaranteed; apply fill_rate
+                if rng.random() > fill_rate:
+                    break
                 entry = min(bid, THRESH)
                 if entry < 0.01: entry=0.01
-                cost = SHARES*entry  # maker, 0 fee
+                cost = SHARES*entry  # maker, 0 fee (stress adds fees separately)
                 outcome_up = bool(w["outcome_up"])
                 win = (side=="UP") == outcome_up
                 pnl = (SHARES*1.0 - cost) if win else -cost
                 trades+=1
                 if win: wins+=1
                 net+=pnl
-                details.append({"side":side,"win":win,"entry":entry,"ask":ask,"pnl":pnl})
+                details.append({"side":side,"win":win,"entry":entry,"ask":ask,"pnl":pnl,"remaining":remaining})
                 break  # one per window
     wr = wins/trades if trades else 0.0
     print("="*70)

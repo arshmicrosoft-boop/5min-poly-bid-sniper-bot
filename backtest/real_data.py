@@ -1,4 +1,9 @@
-"""Stage 2: Real data loaders (Binance klines + Polymarket price history)."""
+"""Stage 2: Real data loaders (Binance klines + approximated Polymarket books).
+
+NOTE: Polymarket books are approximated from Binance via Black-Scholes binary
+MM. Settlement uses Binance TWAP (approximates Chainlink). Model-based only.
+"""
+
 import time
 import math
 from typing import List, Dict, Optional
@@ -30,17 +35,9 @@ def fetch_binance_klines(symbol: str = "BTCUSDT", interval: str = "1m", limit: i
         return []
 
 
-def compute_twap_60s(prices_1s: List[float]) -> List[float]:
-    out = []
-    for i in range(len(prices_1s)):
-        window = prices_1s[max(0, i - 59): i + 1]
-        out.append(sum(window) / len(window))
-    return out
-
-
 def bs_binary_mm_prob(spot: float, strike: float, vol_1s: float, remaining_sec: float) -> float:
     tau = max(1.0, remaining_sec)
-    if vol_1s <= 0:
+    if vol_1s <= 0 or strike <= 0:
         return 0.5
     z = math.log(spot / strike) / (vol_1s * math.sqrt(tau) + 1e-9)
     return float(norm.cdf(z))
@@ -60,77 +57,53 @@ def build_real_windows_from_binance(num_days: int = 7) -> List[Dict]:
             break
     all_candles = all_candles[-candles_needed:]
 
-    # Build 1s prices causally (linear within minute, no look-ahead to future close)
-    prices_1s = []
-    flow_1s = []
-    for c in all_candles:
-        o, cl = c["open"], c["close"]
-        vol = c["volume"] if c["volume"] > 0 else 1.0
-        imbalance = (2.0 * c["taker_buy_base"] / vol) - 1.0
-        for i in range(60):
-            frac = i / 59.0
-            prices_1s.append(o + (cl - o) * frac)
-            flow_1s.append(imbalance)
+    # align to 5-min boundaries (epoch seconds % 300 == 0)
+    # find first candle whose open_time is on a 5-min boundary
+    start_idx = 0
+    for i, c in enumerate(all_candles):
+        if c["open_time"] % 300000 == 0:
+            start_idx = i
+            break
+    aligned = all_candles[start_idx:]
 
-    twaps = compute_twap_60s(prices_1s)
-
-    from datetime import datetime, timezone
+    # per-window realized vol from the same window's minute closes
     windows = []
-    sec_per_window = 300
-    total_sec = len(prices_1s)
-    for w_start in range(60, total_sec - sec_per_window, sec_per_window):
-        # start_twap = 60s TWAP immediately prior to T=0 (index w_start-1)
-        start_idx = w_start - 1
-        # end_twap = final 60s of window (5th minute: T+240..T+300)
-        end_idx = w_start + sec_per_window - 1
-        start_twap = twaps[start_idx] if start_idx >= 0 else twaps[0]
-        end_twap = twaps[end_idx] if end_idx < len(twaps) else twaps[-1]
-        outcome_up = 1 if end_twap >= start_twap else 0
-
-        # realized vol: std of 1-min log returns / sqrt(60)  (FIX: convert to 1s)
-        seg_prices = [c["close"] for c in all_candles]
-        # use minute closes around this window
-        minute_closes = [c["close"] for c in all_candles]
-        # compute 1-min returns for vol
-        rets_1m = []
-        for i in range(1, len(minute_closes)):
-            rets_1m.append(math.log(minute_closes[i] / minute_closes[i - 1]))
-        if rets_1m:
-            sigma_1m = (sum(r * r for r in rets_1m) / len(rets_1m)) ** 0.5
-        else:
-            sigma_1m = 0.008
+    i = 0
+    n = len(aligned)
+    while i + 5 <= n:
+        chunk = aligned[i:i + 5]
+        strike = chunk[0]["open"]
+        closes = [c["close"] for c in chunk]
+        rets = [math.log(closes[j] / closes[j - 1]) for j in range(1, len(closes)) if closes[j - 1] > 0]
+        sigma_1m = (sum(r * r for r in rets) / len(rets)) ** 0.5 if rets else 0.008
         vol_1s = sigma_1m / math.sqrt(60.0)
 
+        end_twap = closes[-1]
+        outcome_up = 1 if end_twap >= strike else 0
+
         snaps = []
-        for elapsed in (60, 120, 180):
-            idx = w_start + elapsed - 1
-            if idx >= len(prices_1s):
-                break
-            curr_twap = twaps[idx]
-            spot = prices_1s[idx]
-            # Simulate a laggy market maker: the book reacts to spot with a delay
-            # (real CLOBs lag spot by ~10-20s). This creates strike-cross windows
-            # where spot has moved through the strike but the book hasn't caught up.
-            LAG_SEC = 15
-            book_spot = prices_1s[max(0, idx - LAG_SEC)]
-            mm_prob = bs_binary_mm_prob(book_spot, start_twap, vol_1s, sec_per_window - elapsed)
-            spread = 0.012 + 0.008 * (1.0 - (sec_per_window - elapsed) / sec_per_window)
+        for k in range(5):
+            c = chunk[k]
+            elapsed = (k + 1) * 60
+            remaining = 300 - elapsed
+            if remaining <= 0:
+                remaining = 1
+            spot = c["close"]
+            mm_prob = bs_binary_mm_prob(spot, strike, vol_1s, remaining)
+            spread = 0.012 + 0.008 * (1.0 - remaining / 300.0)
             up_bid = max(0.001, mm_prob - spread / 2)
             up_ask = min(0.999, mm_prob + spread / 2)
             down_bid = max(0.001, (1 - mm_prob) - spread / 2)
             down_ask = min(0.999, (1 - mm_prob) + spread / 2)
-            ofi = flow_1s[idx]
-            # simulated L2 depth asymmetry proportional to lagged return + noise
-            lag_ret = math.log(spot / start_twap) if start_twap > 0 else 0.0
+            ofi = (2.0 * c["taker_buy_base"] / c["volume"]) - 1.0 if c["volume"] > 0 else 0.0
+            lag_ret = math.log(spot / strike) if strike > 0 else 0.0
             obi = max(-0.6, min(0.6, 0.35 * (1 if lag_ret > 0 else -1 if lag_ret < 0 else 0) + 0.1 * ofi))
-            bid_sizes = [10.0 * (1 + obi), 8.0 * (1 + obi), 6.0 * (1 + obi)]
-            ask_sizes = [10.0 * (1 - obi), 8.0 * (1 - obi), 6.0 * (1 - obi)]
             snaps.append({
                 "elapsed": elapsed,
-                "remaining": sec_per_window - elapsed,
+                "remaining": remaining,
                 "spot": spot,
-                "start_twap": start_twap,
-                "curr_twap": curr_twap,
+                "start_twap": strike,
+                "curr_twap": spot,
                 "realized_vol_1s": vol_1s,
                 "order_flow_imbalance": ofi,
                 "up_bid": up_bid,
@@ -138,19 +111,20 @@ def build_real_windows_from_binance(num_days: int = 7) -> List[Dict]:
                 "down_bid": down_bid,
                 "down_ask": down_ask,
                 "mm_prob": mm_prob,
-                "bid_sizes": bid_sizes,
-                "ask_sizes": ask_sizes,
+                "bid_sizes": [10.0 * (1 + obi), 8.0 * (1 + obi), 6.0 * (1 + obi)],
+                "ask_sizes": [10.0 * (1 - obi), 8.0 * (1 - obi), 6.0 * (1 - obi)],
             })
-        dt = datetime.fromtimestamp(w_start, tz=timezone.utc)
-        quarter_label = f"{dt.year}-Q{(dt.month-1)//3 + 1}"
+        from datetime import datetime, timezone
+        dt = datetime.fromtimestamp(chunk[0]["open_time"] / 1000.0, tz=timezone.utc)
         windows.append({
-            "window_start_ts": w_start,
-            "start_twap": start_twap,
+            "window_start_ts": chunk[0]["open_time"] // 1000,
+            "start_twap": strike,
             "end_twap": end_twap,
             "outcome_up": outcome_up,
-            "quarter_label": quarter_label,
+            "quarter_label": f"{dt.year}-Q{(dt.month - 1) // 3 + 1}",
             "snapshots": snaps,
         })
+        i += 5
     return windows
 
 
@@ -183,7 +157,6 @@ def load_recorded_windows(jsonl_dir: str = "data") -> List[Dict]:
     out = []
     for wts, recs in windows_map.items():
         recs.sort(key=lambda r: r.get("ts", 0))
-        # build minimal snapshots
         snaps = []
         for r in recs:
             ts = r.get("ts", wts)

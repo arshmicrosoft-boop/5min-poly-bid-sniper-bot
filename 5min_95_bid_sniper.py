@@ -52,6 +52,7 @@ load_dotenv(os.path.join(PROJECT_ROOT, '.env'))
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() not in {"0", "false", "no", "off"}
 PAPER_ORDERS = {}
 PAPER_ORDER_SEQUENCE = itertools.count(1)
+OPEN_ORDER_COSTS = {}
 
 sys.path.insert(0, PROJECT_ROOT)
 from nice_funcs import calculate_shares
@@ -75,6 +76,7 @@ SIGNATURE_TYPE = 1 if ACCOUNT_SUFFIX == "" else 2
 BET_SIZE_USD = 1.0
 ENTRY_THRESHOLD = 0.95
 MAX_BUY_PRICE = 0.95
+MAX_TOTAL_EXPOSURE_USD = float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "10.0"))
 ENTRY_WINDOW_SEC = 60
 STOP_THRESHOLD_SEC = 5
 ORDER_UPDATE_INTERVAL = 3
@@ -198,9 +200,10 @@ def get_order_status_for_id(order_id):
         order = PAPER_ORDERS.get(order_id)
         if not order:
             return {'status': 'NOT_FOUND', 'size_matched': 0.0, 'original_size': 0.0,
-                    'price': 0.0, 'is_filled': False}
+                    'price': 0.0, 'has_match': False, 'is_filled': False}
         return {'status': order['status'], 'size_matched': 0.0,
-                'original_size': order['size'], 'price': order['price'], 'is_filled': False}
+                'original_size': order['size'], 'price': order['price'],
+                'has_match': False, 'is_filled': False}
     client = _build_client()
     for attempt in range(3):
         try:
@@ -211,6 +214,7 @@ def get_order_status_for_id(order_id):
                     'size_matched': 0.0,
                     'original_size': 0.0,
                     'price': 0.0,
+                    'has_match': False,
                     'is_filled': False,
                 }
             if isinstance(order, dict):
@@ -228,7 +232,11 @@ def get_order_status_for_id(order_id):
                 'size_matched': size_matched,
                 'original_size': original_size,
                 'price': price,
-                'is_filled': size_matched > 0,
+                'has_match': size_matched > 0,
+                'is_filled': (
+                    status.upper() in ('MATCHED', 'FILLED')
+                    or (original_size > 0 and size_matched >= original_size - 1e-8)
+                ),
             }
         except Exception as e:
             err = str(e)
@@ -287,18 +295,23 @@ def place_limit_order(token_id, side, price, size, neg_risk=False):
         return {}
 
 
-def cancel_token_orders_acct(token_id):
+def cancel_token_orders_acct(token_id, order_id=None):
     if DRY_RUN:
-        for order in PAPER_ORDERS.values():
-            if order['token_id'] == str(token_id) and order['status'] == 'LIVE':
+        for oid, order in list(PAPER_ORDERS.items()):
+            if (order['token_id'] == str(token_id) and order['status'] == 'LIVE'
+                    and (order_id is None or oid == str(order_id))):
                 order['status'] = 'CANCELED'
+                OPEN_ORDER_COSTS.pop(oid, None)
         log_event("DRY RUN: simulated cancellation (memory only)", "yellow")
         return True
 
-    from py_clob_client_v2.clob_types import OrderMarketCancelParams
+    from py_clob_client_v2.clob_types import OrderMarketCancelParams, OrderPayload
     client = _build_client()
     try:
-        client.cancel_market_orders(OrderMarketCancelParams(asset_id=str(token_id)))
+        if order_id and order_id != 'timeout-assumed-live':
+            client.cancel_order(OrderPayload(orderID=str(order_id)))
+        else:
+            client.cancel_market_orders(OrderMarketCancelParams(asset_id=str(token_id)))
         log_event(f"Cancelled orders on {str(token_id)[:10]}...", "yellow")
         return True
     except Exception as e:
@@ -329,11 +342,11 @@ def get_order_book(token_id):
     data = response.json()
     bids = data.get('bids', [])
     asks = data.get('asks', [])
-    if not bids or not asks:
+    if not bids and not asks:
         return None
     return {
-        'best_bid': float(bids[-1]['price']),
-        'best_ask': float(asks[-1]['price']),
+        'best_bid': max((float(level['price']) for level in bids), default=None),
+        'best_ask': min((float(level['price']) for level in asks), default=None),
     }
 
 
@@ -394,7 +407,7 @@ def position_shares_for_token(token_id):
         return 0.0
     user_address = os.getenv(PUBLIC_KEY_ENV_NAME)
     if not user_address:
-        return 0.0
+        return None
     try:
         resp = requests.get(
             "https://data-api.polymarket.com/positions",
@@ -402,7 +415,7 @@ def position_shares_for_token(token_id):
             timeout=8,
         )
         if resp.status_code != 200:
-            return 0.0
+            return None
         for pos in resp.json():
             if str(pos.get('asset')) == str(token_id):
                 size = float(pos.get('size', 0) or 0)
@@ -411,7 +424,7 @@ def position_shares_for_token(token_id):
         return 0.0
     except Exception as e:
         log_event(f"positions fetch failed: {e}", "yellow")
-        return 0.0
+        return None
 
 
 # ============================================================================
@@ -436,16 +449,32 @@ def pick_decided_side(up_book, down_book):
 def compute_bid_target(favored_book):
     if not favored_book:
         return None
-    if favored_book['best_ask'] < ENTRY_THRESHOLD:
+    best_ask = favored_book.get('best_ask')
+    best_bid = favored_book.get('best_bid')
+    if best_ask is None or best_ask < ENTRY_THRESHOLD or best_bid is None:
         return None
-    target = min(favored_book['best_bid'], MAX_BUY_PRICE)
-    return round(target, 3)
+    # Keep the post-only BUY strictly below the current best ask.
+    max_maker_bid = round(best_ask - 0.01, 3)
+    target = min(best_bid, max_maker_bid, MAX_BUY_PRICE)
+    return round(target, 3) if target >= 0.01 else None
+
+
+def _current_exposure_usd():
+    return sum(OPEN_ORDER_COSTS.values())
 
 
 def _place_fresh_bid(state, token_id, target_price):
     global SESSION_ATTEMPTS
     shares = calculate_shares(BET_SIZE_USD, target_price)
     if shares <= 0:
+        return
+    order_cost = target_price * shares
+    current = _current_exposure_usd()
+    if current + order_cost > MAX_TOTAL_EXPOSURE_USD:
+        log_event(
+            f"Exposure cap reached (${current:.2f}+${order_cost:.2f} > ${MAX_TOTAL_EXPOSURE_USD:.2f}); skipping bid",
+            "yellow",
+        )
         return
     SESSION_ATTEMPTS += 1
     resp = place_limit_order(token_id, "BUY", target_price, shares, neg_risk=state['neg_risk'])
@@ -455,10 +484,15 @@ def _place_fresh_bid(state, token_id, target_price):
             state['last_order_id'] = oid
             state['last_order_price'] = target_price
             state['open_order_price'] = target_price
+            state['exposure_key'] = str(oid)
+            OPEN_ORDER_COSTS[str(oid)] = order_cost
         elif oid == 'timeout-assumed-live':
             state['last_order_id'] = 'timeout-assumed-live'
             state['last_order_price'] = target_price
             state['open_order_price'] = target_price
+            exposure_key = f"timeout:{state['market_info']['slug']}"
+            state['exposure_key'] = exposure_key
+            OPEN_ORDER_COSTS[exposure_key] = order_cost
 
 
 def new_market_state(market_ts, market_info):
@@ -472,6 +506,7 @@ def new_market_state(market_ts, market_info):
         'entered': False,
         'entry_fill_price': None,
         'last_order_id': None,
+        'exposure_key': None,
         'last_order_price': None,
         'open_order_price': None,
         'last_order_update': 0.0,
@@ -534,8 +569,10 @@ def draw_dashboard(market_states, market_books, time_left):
             rows.append(f"{symbol:<6} market unavailable in this window")
             continue
         up_book, down_book = market_books.get(symbol, (None, None))
+        def price(value):
+            return f"{value:.3f}" if value is not None else "---"
         def quote(book):
-            return f"{book['best_bid']:.3f}/{book['best_ask']:.3f}" if book else "---/---"
+            return f"{price(book.get('best_bid'))}/{price(book.get('best_ask'))}" if book else "---/---"
         side = market_state.get('favored_side') or "watching"
         if market_state.get('last_order_id'):
             kind = "SIM" if DRY_RUN else "LIVE"
@@ -578,19 +615,83 @@ def draw_scoreboard(market_states):
     print(colored("-" * 40, "cyan"))
 
 
-def _cancel_and_confirm(token_id, order_id):
-    """Cancel and verify the order before allowing another order to be sent."""
+def _cancel_and_confirm(token_id, order_id, wait_sec=0.6, exposure_key=None):
+    """Cancel an order and classify whether it filled during the cancellation race."""
+    exposure_key = str(exposure_key or order_id)
     if DRY_RUN:
-        order = PAPER_ORDERS.get(order_id)
-        if order:
-            order['status'] = 'CANCELED'
-        log_event("DRY RUN: simulated order canceled", "yellow")
-        return True
-    if not cancel_token_orders_acct(token_id):
-        return False
-    time.sleep(1.0)
+        cancel_token_orders_acct(token_id, order_id=order_id)
+        OPEN_ORDER_COSTS.pop(exposure_key, None)
+        return "CANCELED", {
+            'status': 'CANCELED', 'size_matched': 0.0, 'original_size': 0.0,
+            'price': 0.0, 'has_match': False, 'is_filled': False,
+        }
+
+    uncertain_order = order_id == 'timeout-assumed-live'
+    canceled = cancel_token_orders_acct(
+        token_id, order_id=None if uncertain_order else order_id
+    )
+    if wait_sec > 0:
+        time.sleep(wait_sec)
+
+    if uncertain_order:
+        # A timed-out submit has no order ID to query; cancel all orders for its
+        # token and use the positions endpoint to detect a fill before clearing risk.
+        if not canceled:
+            return "FAILED", None
+        shares = position_shares_for_token(token_id)
+        if shares is None:
+            return "FAILED", None
+        if shares > 0:
+            return "FILLED", {
+                'status': 'CANCELED', 'size_matched': shares, 'original_size': shares,
+                'price': 0.0, 'has_match': True, 'is_filled': True,
+            }
+        OPEN_ORDER_COSTS.pop(exposure_key, None)
+        return "CANCELED", {
+            'status': 'CANCELED', 'size_matched': 0.0, 'original_size': 0.0,
+            'price': 0.0, 'has_match': False, 'is_filled': False,
+        }
+
     result = get_order_status_for_id(order_id)
-    return bool(result and result != "ERROR" and result.get('status') in ('CANCELED', 'CANCELLED', 'NOT_FOUND'))
+    if not result or result == "ERROR":
+        return "FAILED", None
+    if result.get('has_match'):
+        if result.get('status') == 'LIVE' and not result.get('is_filled'):
+            return "FAILED", result
+        matched_cost = float(result.get('size_matched') or 0) * float(result.get('price') or 0)
+        if matched_cost > 0:
+            OPEN_ORDER_COSTS[exposure_key] = matched_cost
+        return "FILLED", result
+    if result.get('status') in ('CANCELED', 'CANCELLED', 'NOT_FOUND'):
+        OPEN_ORDER_COSTS.pop(exposure_key, None)
+        return "CANCELED", result
+    return "FAILED", result
+
+
+def _clear_order_state(market_state):
+    market_state['last_order_id'] = None
+    market_state['last_order_price'] = None
+    market_state['open_order_price'] = None
+    market_state['exposure_key'] = None
+
+
+def _record_fill(symbol, market_state, fill_status, preserve_open_order=False):
+    """Record any matched quantity while keeping its cost reserved this window."""
+    global SESSION_ENTRIES
+    if not fill_status:
+        return
+    matched = float(fill_status.get('size_matched') or 0.0)
+    if matched <= 0 and fill_status.get('is_filled'):
+        matched = float(fill_status.get('original_size') or 0.0)
+    price = float(fill_status.get('price') or market_state.get('last_order_price') or 0.0)
+    exposure_key = str(market_state.get('exposure_key') or market_state.get('last_order_id') or '')
+    if matched > 0 and price > 0 and exposure_key and not preserve_open_order:
+        OPEN_ORDER_COSTS[exposure_key] = matched * price
+    if not market_state.get('entered'):
+        SESSION_ENTRIES += 1
+    market_state['entered'] = True
+    market_state['entry_fill_price'] = price
+    log_event(f"{symbol} matched {matched:.2f} shares @ ${price:.3f}; holding to expiry", "green")
 
 
 def _poll_book(token_id, side_label):
@@ -599,147 +700,6 @@ def _poll_book(token_id, side_label):
     except Exception as exc:
         log_event(f"{side_label} book request failed: {type(exc).__name__}", "yellow")
         return None
-
-
-def legacy_main():
-    global SESSION_SKIPS, SESSION_ENTRIES
-    _validate_configuration()
-    reset_market_state()
-    up_book = down_book = None
-    log_event(
-        "Bot started in DRY RUN; no account orders will be sent" if DRY_RUN
-        else "Bot started in LIVE ORDER mode",
-        "yellow" if DRY_RUN else "green",
-    )
-
-    try:
-        while True:
-            now = time.time()
-            market_ts = get_current_market_timestamp()
-            time_left = get_time_remaining(market_ts)
-
-            # New five-minute market: cancel any unfilled order from the old one,
-            # then fetch the new market metadata with brief retries.
-            if market_ts != state['market_ts']:
-                old_token = state.get('favored_token_id')
-                old_order = state.get('last_order_id')
-                if old_token and old_order and not state.get('entered'):
-                    if old_order == 'timeout-assumed-live':
-                        cancel_token_orders_acct(old_token)
-                    else:
-                        _cancel_and_confirm(old_token, old_order)
-                reset_market_state()
-                state['market_ts'] = market_ts
-                up_book = down_book = None
-                log_event(f"New market window {market_ts}", "cyan")
-                for attempt in range(8):
-                    try:
-                        info = get_market_info(market_ts)
-                    except Exception as exc:
-                        info = None
-                        log_event(f"Market lookup failed: {type(exc).__name__}", "yellow")
-                    if info:
-                        state['market_info'] = info
-                        state['neg_risk'] = info.get('neg_risk', False)
-                        log_event("Market tokens loaded", "green")
-                        break
-                    time.sleep(1.0)
-                if not state['market_info']:
-                    log_event("Market not available yet; will retry", "yellow")
-
-            info = state.get('market_info')
-            if info:
-                up_book = _poll_book(info['up_token_id'], "UP")
-                down_book = _poll_book(info['down_token_id'], "DOWN")
-
-            time_left = get_time_remaining(market_ts)
-            in_window = ENTRY_WINDOW_SEC >= time_left > STOP_THRESHOLD_SEC
-
-            # Stop opening orders at the cutoff. Cancel an unfilled resting order
-            # and clear it only after the CLOB confirms cancellation.
-            if (not state['entered'] and time_left <= STOP_THRESHOLD_SEC
-                    and state['last_order_id'] and state['favored_token_id']):
-                oid = state['last_order_id']
-                if oid == 'timeout-assumed-live':
-                    cancel_token_orders_acct(state['favored_token_id'])
-                    log_event("Cutoff reached; cancel requested for unverified order", "yellow")
-                elif _cancel_and_confirm(state['favored_token_id'], oid):
-                    state['last_order_id'] = None
-                    state['last_order_price'] = None
-                    state['open_order_price'] = None
-                    log_event("Cutoff reached; resting order canceled", "yellow")
-
-            if (info and not state['entered'] and in_window and up_book and down_book
-                    and now - state['last_order_update'] >= ORDER_UPDATE_INTERVAL):
-                state['last_order_update'] = now
-
-                if state['favored_side'] is None:
-                    side, _ = pick_decided_side(up_book, down_book)
-                    if side:
-                        state['favored_side'] = side
-                        state['favored_token_id'] = info['up_token_id'] if side == "UP" else info['down_token_id']
-                        log_event(f"{side} crossed the decided threshold", "green")
-                    else:
-                        SESSION_SKIPS += 1
-
-                if state['favored_side'] is not None:
-                    token_id = state['favored_token_id']
-                    favored_book = up_book if state['favored_side'] == "UP" else down_book
-                    shares_held = position_shares_for_token(token_id)
-
-                    if shares_held > 0:
-                        state['entered'] = True
-                        state['entry_fill_price'] = state['last_order_price'] or 0.0
-                        SESSION_ENTRIES += 1
-                        log_event(f"Position detected ({shares_held:.2f} shares); holding to expiry", "green")
-                    elif state['last_order_id'] == 'timeout-assumed-live':
-                        # The post timed out, so do not risk submitting a duplicate.
-                        state['entered'] = True
-                    elif state['last_order_id']:
-                        oid = state['last_order_id']
-                        status = get_order_status_for_id(oid)
-                        if status == "ERROR" or status is None:
-                            pass  # Cannot prove order state; do not submit another.
-                        elif status['is_filled']:
-                            state['entered'] = True
-                            state['entry_fill_price'] = status['price'] or state['last_order_price'] or 0.0
-                            SESSION_ENTRIES += 1
-                            log_event("Order filled; holding to expiry", "green")
-                        elif status['status'] == 'LIVE':
-                            target_price = compute_bid_target(favored_book)
-                            old_price = status['price'] or state['last_order_price']
-                            if target_price is None:
-                                if _cancel_and_confirm(token_id, oid):
-                                    state['last_order_id'] = None
-                                    state['last_order_price'] = None
-                                    state['open_order_price'] = None
-                                    log_event("Side no longer decided; order canceled", "yellow")
-                            elif old_price and abs(old_price - target_price) > PRICE_HOLD_TOLERANCE:
-                                if _cancel_and_confirm(token_id, oid):
-                                    state['last_order_id'] = None
-                                    state['last_order_price'] = None
-                                    state['open_order_price'] = None
-                                    _place_fresh_bid(state, token_id, target_price)
-                        elif status['status'] in ('CANCELED', 'CANCELLED', 'NOT_FOUND'):
-                            state['last_order_id'] = None
-                            state['last_order_price'] = None
-                            state['open_order_price'] = None
-                            target_price = compute_bid_target(favored_book)
-                            if target_price is not None:
-                                _place_fresh_bid(state, token_id, target_price)
-                    else:
-                        target_price = compute_bid_target(favored_book)
-                        if target_price is not None:
-                            _place_fresh_bid(state, token_id, target_price)
-
-            draw_dashboard(up_book, down_book, time_left)
-            time.sleep(1.0)
-
-    except KeyboardInterrupt:
-        if state.get('last_order_id') and state.get('favored_token_id') and not state.get('entered'):
-            cancel_token_orders_acct(state['favored_token_id'])
-        print(colored("\nStopped by user.", "yellow"))
-        draw_scoreboard()
 
 
 def main():
@@ -756,21 +716,76 @@ def main():
         "yellow" if DRY_RUN else "green",
     )
 
+    def settle_cancel(symbol, market_state, outcome, status):
+        order_id = market_state.get('last_order_id')
+        if outcome == "FILLED":
+            _record_fill(symbol, market_state, status)
+            _clear_order_state(market_state)
+            return
+        if outcome == "CANCELED":
+            OPEN_ORDER_COSTS.pop(str(market_state.get('exposure_key') or order_id), None)
+            _clear_order_state(market_state)
+            log_event(f"{symbol} resting order canceled", "yellow")
+            return
+        if status and status.get('has_match'):
+            # A partial fill exists, but the remainder is not confirmed canceled.
+            # Count the position once and keep the full reservation until canceled.
+            _record_fill(symbol, market_state, status, preserve_open_order=True)
+        log_event(f"{symbol} order cancellation not confirmed; retaining exposure reservation", "red")
+
     try:
         while True:
             now = time.time()
             market_ts = get_current_market_timestamp()
-            time_left = get_time_remaining(market_ts)
 
             if market_ts != current_market_ts:
-                for old_state in market_states.values():
-                    order_id = old_state.get('last_order_id')
-                    token_id = old_state.get('favored_token_id')
-                    if order_id and token_id and not old_state.get('entered'):
-                        if order_id == 'timeout-assumed-live':
-                            cancel_token_orders_acct(token_id)
-                        else:
-                            _cancel_and_confirm(token_id, order_id)
+                previous_states = market_states
+                cancel_futures = {
+                    executor.submit(
+                        _cancel_and_confirm,
+                        old_state['favored_token_id'],
+                        old_state['last_order_id'],
+                        0.2,
+                        old_state.get('exposure_key'),
+                    ): (symbol, old_state)
+                    for symbol, old_state in previous_states.items()
+                    if old_state.get('last_order_id') and old_state.get('favored_token_id')
+                }
+                unresolved = []
+                for future in as_completed(cancel_futures):
+                    symbol, old_state = cancel_futures[future]
+                    try:
+                        outcome, status = future.result()
+                    except Exception as exc:
+                        outcome, status = "FAILED", None
+                        log_event(f"{symbol} rollover cancel failed: {type(exc).__name__}", "red")
+                    settle_cancel(symbol, old_state, outcome, status)
+                    if outcome == "FAILED":
+                        unresolved.append((symbol, old_state))
+
+                # Retry ambiguous leftovers with an asset-wide cancel at the
+                # boundary. Filled-position reservations are scoped to the old
+                # five-minute window and are released before the new one starts.
+                fallback_futures = {
+                    executor.submit(cancel_token_orders_acct, old_state['favored_token_id']): (symbol, old_state)
+                    for symbol, old_state in unresolved
+                    if old_state.get('favored_token_id')
+                }
+                unresolved_costs = {}
+                for future in as_completed(fallback_futures):
+                    symbol, old_state = fallback_futures[future]
+                    try:
+                        canceled = future.result()
+                    except Exception:
+                        canceled = False
+                    if not canceled:
+                        log_event(f"{symbol} rollover asset-wide cancel failed", "red")
+                        exposure_key = str(old_state.get('exposure_key') or old_state.get('last_order_id'))
+                        if exposure_key in OPEN_ORDER_COSTS:
+                            unresolved_costs[exposure_key] = OPEN_ORDER_COSTS[exposure_key]
+                OPEN_ORDER_COSTS.clear()
+                OPEN_ORDER_COSTS.update(unresolved_costs)
+
                 current_market_ts = market_ts
                 market_states = {}
                 market_books = {}
@@ -796,7 +811,9 @@ def main():
                     log_event("No target crypto markets listed yet; will retry", "yellow")
 
             missing = [symbol for symbol in CRYPTO_ASSETS if symbol not in market_states]
-            if missing and now >= next_discovery_at:
+            # Market discovery can block on network timeouts. Stop retrying
+            # before the cutoff so it cannot delay cancellation of live bids.
+            if missing and now >= next_discovery_at and get_time_remaining(market_ts) > STOP_THRESHOLD_SEC:
                 futures = {
                     executor.submit(get_market_info, market_ts, symbol): symbol
                     for symbol in missing
@@ -815,8 +832,35 @@ def main():
                         log_event(f"{symbol} market tokens loaded", "green")
                 next_discovery_at = time.time() + DISCOVERY_RETRY_SEC
 
-            # Poll all discovered token books concurrently to keep the shared
-            # entry window responsive when a public endpoint is slow.
+            time_left = get_time_remaining(market_ts)
+            if time_left <= STOP_THRESHOLD_SEC:
+                # Do not wait on book requests before canceling at cutoff. All
+                # assets cancel concurrently; each order gets its own status check.
+                cutoff_futures = {
+                    executor.submit(
+                        _cancel_and_confirm,
+                        market_state['favored_token_id'],
+                        market_state['last_order_id'],
+                        0.15,
+                        market_state.get('exposure_key'),
+                    ): (symbol, market_state)
+                    for symbol, market_state in market_states.items()
+                    if market_state.get('last_order_id') and market_state.get('favored_token_id')
+                }
+                for future in as_completed(cutoff_futures):
+                    symbol, market_state = cutoff_futures[future]
+                    try:
+                        outcome, status = future.result()
+                    except Exception as exc:
+                        outcome, status = "FAILED", None
+                        log_event(f"{symbol} cutoff cancel failed: {type(exc).__name__}", "red")
+                    settle_cancel(symbol, market_state, outcome, status)
+                draw_dashboard(market_states, market_books, time_left)
+                time.sleep(1.0)
+                continue
+
+            # Poll all discovered books concurrently. A book may validly have
+            # only bids or only asks; each outcome is evaluated independently.
             book_futures = {}
             for symbol, market_state in market_states.items():
                 info = market_state['market_info']
@@ -830,99 +874,164 @@ def main():
                 except Exception as exc:
                     log_event(f"{symbol} {side} book poll failed: {type(exc).__name__}", "yellow")
             for symbol, books in fresh_books.items():
-                previous = market_books.get(symbol, (None, None))
-                market_books[symbol] = (books["UP"] or previous[0], books["DOWN"] or previous[1])
+                market_books[symbol] = (books["UP"], books["DOWN"])
 
+            now = time.time()
             time_left = get_time_remaining(market_ts)
             in_window = ENTRY_WINDOW_SEC >= time_left > STOP_THRESHOLD_SEC
             for symbol, market_state in market_states.items():
-                up_book, down_book = market_books.get(symbol, (None, None))
-
-                if (not market_state['entered'] and time_left <= STOP_THRESHOLD_SEC
-                        and market_state['last_order_id'] and market_state['favored_token_id']):
-                    order_id = market_state['last_order_id']
-                    if order_id == 'timeout-assumed-live':
-                        cancel_token_orders_acct(market_state['favored_token_id'])
-                        log_event(f"{symbol} cutoff reached; cancel requested for uncertain order", "yellow")
-                    elif _cancel_and_confirm(market_state['favored_token_id'], order_id):
-                        market_state['last_order_id'] = None
-                        market_state['last_order_price'] = None
-                        market_state['open_order_price'] = None
-                        log_event(f"{symbol} cutoff reached; order canceled", "yellow")
-
-                if not (in_window and up_book and down_book and not market_state['entered']
-                        and now - market_state['last_order_update'] >= ORDER_UPDATE_INTERVAL):
+                if not in_window or now - market_state['last_order_update'] < ORDER_UPDATE_INTERVAL:
                     continue
                 market_state['last_order_update'] = now
-                if market_state['favored_side'] is None:
-                    side, _ = pick_decided_side(up_book, down_book)
-                    if side:
-                        market_state['favored_side'] = side
-                        token_key = 'up_token_id' if side == "UP" else 'down_token_id'
-                        market_state['favored_token_id'] = market_state['market_info'][token_key]
-                        log_event(f"{symbol} {side} crossed the decided threshold", "green")
-                    else:
-                        SESSION_SKIPS += 1
+                up_book, down_book = market_books.get(symbol, (None, None))
 
-                if market_state['favored_side'] is None:
+                # Uncertain submissions have no queryable order ID. Never
+                # duplicate them; discover/cancel them through position polling.
+                if market_state.get('last_order_id') == 'timeout-assumed-live':
+                    token_id = market_state['favored_token_id']
+                    shares = position_shares_for_token(token_id)
+                    if shares is None:
+                        continue
+                    if shares > 0:
+                        outcome, status = _cancel_and_confirm(
+                            token_id, 'timeout-assumed-live', 0.15,
+                            market_state.get('exposure_key'),
+                        )
+                        if outcome == "FILLED":
+                            _record_fill(symbol, market_state, status)
+                            _clear_order_state(market_state)
+                        elif outcome == "CANCELED":
+                            _record_fill(symbol, market_state, {
+                                'size_matched': shares, 'price': market_state.get('last_order_price'),
+                                'has_match': True,
+                            })
+                            _clear_order_state(market_state)
+                        elif outcome == "FAILED":
+                            _record_fill(symbol, market_state, {
+                                'size_matched': shares, 'price': market_state.get('last_order_price'),
+                                'has_match': True,
+                            }, preserve_open_order=True)
                     continue
-                token_id = market_state['favored_token_id']
-                favored_book = up_book if market_state['favored_side'] == "UP" else down_book
-                shares_held = position_shares_for_token(token_id)
-                if shares_held > 0:
-                    market_state['entered'] = True
-                    market_state['entry_fill_price'] = market_state['last_order_price'] or 0.0
-                    SESSION_ENTRIES += 1
-                    log_event(f"{symbol} position detected ({shares_held:.2f} shares); holding to expiry", "green")
-                    continue
-                if market_state['last_order_id'] == 'timeout-assumed-live':
-                    market_state['entered'] = True
-                    continue
-                if market_state['last_order_id']:
-                    order_id = market_state['last_order_id']
+
+                order_id = market_state.get('last_order_id')
+                if order_id:
                     status = get_order_status_for_id(order_id)
                     if status == "ERROR" or status is None:
                         continue
-                    if status['is_filled']:
-                        market_state['entered'] = True
-                        market_state['entry_fill_price'] = status['price'] or market_state['last_order_price'] or 0.0
-                        SESSION_ENTRIES += 1
-                        log_event(f"{symbol} order filled; holding to expiry", "green")
+                    has_match = status.get('has_match', False) or status.get('is_filled', False)
+                    if has_match:
+                        if status.get('status') == 'LIVE' and not status.get('is_filled'):
+                            outcome, final_status = _cancel_and_confirm(
+                                market_state['favored_token_id'], order_id, 0.15,
+                                market_state.get('exposure_key'),
+                            )
+                            if outcome == "FILLED":
+                                _record_fill(symbol, market_state, final_status)
+                                _clear_order_state(market_state)
+                            elif outcome == "CANCELED":
+                                _record_fill(symbol, market_state, status)
+                                _clear_order_state(market_state)
+                            else:
+                                _record_fill(
+                                    symbol, market_state, final_status or status,
+                                    preserve_open_order=True,
+                                )
+                            continue
+                        _record_fill(symbol, market_state, status)
+                        _clear_order_state(market_state)
                         continue
-                    if status['status'] == 'LIVE':
+
+                    if status.get('status') in ('CANCELED', 'CANCELLED', 'NOT_FOUND'):
+                        OPEN_ORDER_COSTS.pop(str(market_state.get('exposure_key') or order_id), None)
+                        _clear_order_state(market_state)
+                        market_state['favored_side'] = None
+                        market_state['favored_token_id'] = None
+                        order_id = None
+                    elif status.get('status') == 'LIVE':
+                        # Check fills even if the opposite outcome has no book.
+                        # Only use a fresh selected-side book for repricing/cancel.
+                        if market_state.get('entered'):
+                            outcome, final_status = _cancel_and_confirm(
+                                market_state['favored_token_id'], order_id, 0.15,
+                                market_state.get('exposure_key'),
+                            )
+                            if outcome == "FILLED":
+                                _record_fill(symbol, market_state, final_status)
+                                _clear_order_state(market_state)
+                            continue
+                        favored_book = up_book if market_state.get('favored_side') == "UP" else down_book
+                        if favored_book is None:
+                            continue
                         target_price = compute_bid_target(favored_book)
-                        old_price = status['price'] or market_state['last_order_price']
+                        old_price = status.get('price') or market_state['last_order_price']
                         if target_price is None:
-                            if _cancel_and_confirm(token_id, order_id):
-                                market_state['last_order_id'] = None
-                                market_state['last_order_price'] = None
-                                market_state['open_order_price'] = None
-                                log_event(f"{symbol} side no longer decided; order canceled", "yellow")
-                        elif old_price and abs(old_price - target_price) > PRICE_HOLD_TOLERANCE:
-                            if _cancel_and_confirm(token_id, order_id):
-                                market_state['last_order_id'] = None
-                                market_state['last_order_price'] = None
-                                market_state['open_order_price'] = None
-                                _place_fresh_bid(market_state, token_id, target_price)
-                    elif status['status'] in ('CANCELED', 'CANCELLED', 'NOT_FOUND'):
-                        market_state['last_order_id'] = None
-                        market_state['last_order_price'] = None
-                        market_state['open_order_price'] = None
-                        target_price = compute_bid_target(favored_book)
-                        if target_price is not None:
-                            _place_fresh_bid(market_state, token_id, target_price)
-                else:
-                    target_price = compute_bid_target(favored_book)
-                    if target_price is not None:
-                        _place_fresh_bid(market_state, token_id, target_price)
+                            outcome, final_status = _cancel_and_confirm(
+                                market_state['favored_token_id'], order_id, 0.15,
+                                market_state.get('exposure_key'),
+                            )
+                            if outcome == "FILLED":
+                                _record_fill(symbol, market_state, final_status)
+                                _clear_order_state(market_state)
+                            elif outcome == "CANCELED":
+                                _clear_order_state(market_state)
+                                market_state['favored_side'] = None
+                                market_state['favored_token_id'] = None
+                            continue
+                        if old_price and abs(old_price - target_price) > PRICE_HOLD_TOLERANCE:
+                            outcome, final_status = _cancel_and_confirm(
+                                market_state['favored_token_id'], order_id, 0.15,
+                                market_state.get('exposure_key'),
+                            )
+                            if outcome == "FILLED":
+                                _record_fill(symbol, market_state, final_status)
+                                _clear_order_state(market_state)
+                            elif outcome == "CANCELED":
+                                _clear_order_state(market_state)
+                                _place_fresh_bid(market_state, market_state['favored_token_id'], target_price)
+                            continue
+                        continue
+
+                if market_state.get('entered'):
+                    continue
+                if market_state.get('favored_side') is None:
+                    if up_book is None and down_book is None:
+                        continue
+                    side, _ = pick_decided_side(up_book, down_book)
+                    if side is None:
+                        SESSION_SKIPS += 1
+                        continue
+                    market_state['favored_side'] = side
+                    token_key = 'up_token_id' if side == "UP" else 'down_token_id'
+                    market_state['favored_token_id'] = market_state['market_info'][token_key]
+                    log_event(f"{symbol} {side} crossed the decided threshold", "green")
+
+                favored_book = up_book if market_state['favored_side'] == "UP" else down_book
+                target_price = compute_bid_target(favored_book)
+                if target_price is not None:
+                    _place_fresh_bid(market_state, market_state['favored_token_id'], target_price)
 
             draw_dashboard(market_states, market_books, time_left)
             time.sleep(1.0)
 
     except KeyboardInterrupt:
-        for market_state in market_states.values():
-            if market_state.get('last_order_id') and market_state.get('favored_token_id') and not market_state.get('entered'):
-                cancel_token_orders_acct(market_state['favored_token_id'])
+        pending = {
+            executor.submit(
+                _cancel_and_confirm,
+                market_state['favored_token_id'],
+                market_state['last_order_id'],
+                0.15,
+                market_state.get('exposure_key'),
+            ): (symbol, market_state)
+            for symbol, market_state in market_states.items()
+            if market_state.get('last_order_id') and market_state.get('favored_token_id')
+        }
+        for future in as_completed(pending):
+            symbol, market_state = pending[future]
+            try:
+                outcome, status = future.result()
+            except Exception:
+                outcome, status = "FAILED", None
+            settle_cancel(symbol, market_state, outcome, status)
         print(colored("\nStopped by user.", "yellow"))
         draw_scoreboard(market_states)
     finally:

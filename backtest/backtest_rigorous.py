@@ -44,9 +44,9 @@ def summarize_extra(trades, aux):
     inverted_wr = (n - wins) / n if n else 0.0
     # lead rate = agreement with Binance direction among trades with that info
     with_bin = [x for x in t if x.get("binance_up") is not None]
-    lead_rate = (sum((x["selected_side"] == "UP") == x["binance_up"] for x in with_bin) / len(with_bin)) if with_bin else None
+    lead_rate = (sum((x["side"] == "UP") == x["binance_up"] for x in with_bin) / len(with_bin)) if with_bin else None
     # counter-lead trades: selected side disagrees with Binance direction
-    counter = [x for x in with_bin if (x["selected_side"] == "UP") != x["binance_up"]]
+    counter = [x for x in with_bin if (x["side"] == "UP") != x["binance_up"]]
     counter_wr = (sum(bool(x["won"]) for x in counter) / len(counter)) if counter else None
     # bootstrap CI
     blo, bhi = bootstrap_wr_ci(t)

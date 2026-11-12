@@ -210,13 +210,18 @@ def run_backtest(path, latency_ms=DEFAULT_LATENCY_MS, slip_multiplier=1.0,
                 elif etype == "market_resolved":
                     winner = str(p.get("winning_asset_id", p.get("winningAssetId", "")))
             elif kind == "dec":
-                if entered or pending or not (start_ms + 240000 <= t < end_ms - 5000):
+                if entered or pending or not (start_ms + 240000 <= t <= end_ms - 5000):
                     continue
                 def bbo(side):
                     bl, al = bids[side], asks[side]
                     if not bl or not al:
                         return None
                     return max(bl), min(al)
+                # Allow switching decided side if the current one stops qualifying.
+                if selected is not None:
+                    q = bbo(selected)
+                    if not q or q[1] < threshold:
+                        selected = None
                 if selected is None:
                     qualifying = []
                     up = bbo("UP"); down = bbo("DOWN")
@@ -228,15 +233,23 @@ def run_backtest(path, latency_ms=DEFAULT_LATENCY_MS, slip_multiplier=1.0,
                         selected = max(qualifying, key=lambda x: x[1])[0]
                 if selected is None:
                     continue
+                # Final 5 seconds: cancel any resting order, no new submits.
+                if t >= end_ms - 5000:
+                    if order is not None and not order.get("cancel_pending"):
+                        order["cancel_pending"] = True
+                        pending = True
+                        heapq.heappush(market_events, (t + latency_ms + 1500, 2, seq, "act", ("cancel", None)))
+                        seq += 1
+                    continue
                 quote = bbo(selected)
                 desired = min(quote[0], cap) if (quote and quote[1] >= threshold) else None
                 if order is not None:
                     if desired is None or abs(order["price"] - desired) > 0.005:
-                        # cancel + resubmit
-                        order = None
-                        pending = True
-                        heapq.heappush(market_events, (t + latency_ms + 1500, 2, seq, "act", ("submit", desired)))
-                        seq += 1
+                        if not order.get("cancel_pending"):
+                            order["cancel_pending"] = True
+                            pending = True
+                            heapq.heappush(market_events, (t + latency_ms + 1500, 2, seq, "act", ("cancel", desired)))
+                            seq += 1
                     continue
                 if desired is not None:
                     pending = True
@@ -245,7 +258,14 @@ def run_backtest(path, latency_ms=DEFAULT_LATENCY_MS, slip_multiplier=1.0,
             elif kind == "act":
                 pending = False
                 action, price = payload
-                if action == "submit":
+                if action == "cancel":
+                    # cancel completes after latency; order may have taken toxic fills
+                    order = None
+                    if price is not None and not entered and t < end_ms - 5000:
+                        # resubmit at desired price after cancel-confirm wait
+                        heapq.heappush(market_events, (t + 1500, 2, seq, "act", ("submit", price)))
+                        seq += 1
+                elif action == "submit":
                     if entered or t >= end_ms - 5000 or price is None:
                         continue
                     quote = bbo(selected) if selected else None
@@ -259,7 +279,6 @@ def run_backtest(path, latency_ms=DEFAULT_LATENCY_MS, slip_multiplier=1.0,
                     order = {"side": selected, "price": price, "shares": shares,
                              "queue": queue, "queue_initial": queue, "live_ms": t, "filled": 0.0}
                     order_attempts += 1
-                # cancel handled implicitly by setting order=None above
         # end while
 
         markets_with_orders += order_attempts > 0
