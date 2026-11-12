@@ -114,6 +114,8 @@ SESSION_TIMEOUTS = 0
 SESSION_PAPER_WINS = 0
 SESSION_PAPER_LOSSES = 0
 SESSION_PAPER_PNL = 0.0
+SESSION_PAPER_COST = 0.0
+SESSION_PAPER_SHARES = 0.0
 SESSION_START = time.time()
 
 # ============================================================================
@@ -328,6 +330,10 @@ def place_limit_order(token_id, side, price, size, neg_risk=False):
             'token_id': str(token_id), 'side': side.upper(), 'price': float(price),
             'size': float(size), 'status': 'LIVE', 'created_at': time.time(),
         }
+        OPEN_ORDER_COSTS[order_id] = float(price) * float(size)
+        global SESSION_PAPER_COST, SESSION_PAPER_SHARES
+        SESSION_PAPER_COST += float(price) * float(size)
+        SESSION_PAPER_SHARES += float(size)
         log_event(f"DRY RUN: simulated {side} @ ${price:.4f} x {size} (memory only)", "yellow")
         return {'orderID': order_id, 'status': 'LIVE', 'simulated': True}
 
@@ -1260,8 +1266,12 @@ def draw_dashboard(market_states, market_books, time_left):
         if separator:
             risk_row_2_left.append(_seg(" " * separator))
         risk_row_2_left += chunk
-    loss_value = _signed_money(-filled_cost)
-    profit_value = _signed_money(max(0.0, filled_shares - filled_cost))
+    if DRY_RUN:
+        loss_value = _signed_money(-SESSION_PAPER_COST)
+        profit_value = _signed_money(max(0.0, SESSION_PAPER_SHARES - SESSION_PAPER_COST))
+    else:
+        loss_value = _signed_money(-filled_cost)
+        profit_value = _signed_money(max(0.0, filled_shares - filled_cost))
     loss_color = C_BAD if filled_cost else C_MUTED
     profit_color = C_GOOD if filled_shares > filled_cost else C_MUTED
     loss_profit_variants = [
