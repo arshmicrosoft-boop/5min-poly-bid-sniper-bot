@@ -30,6 +30,7 @@ import time
 import random
 import itertools
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 import requests
@@ -137,6 +138,7 @@ def log_event(msg, color="white"):
 # POLYMARKET CLIENT HELPERS (account-aware)
 # ============================================================================
 _CLIENT_CACHE = None
+_CLIENT_LOCK = threading.Lock()
 
 
 def _build_client():
@@ -145,52 +147,55 @@ def _build_client():
         raise RuntimeError("CLOB account client is disabled while DRY_RUN is enabled")
     if _CLIENT_CACHE is not None:
         return _CLIENT_CACHE
+    with _CLIENT_LOCK:
+        if _CLIENT_CACHE is not None:
+            return _CLIENT_CACHE
 
-    from py_clob_client_v2.client import ClobClient
-    from py_clob_client_v2.clob_types import ApiCreds
-    from py_clob_client_v2.constants import POLYGON
-    from web3 import Web3
+        from py_clob_client_v2.client import ClobClient
+        from py_clob_client_v2.clob_types import ApiCreds
+        from py_clob_client_v2.constants import POLYGON
+        from web3 import Web3
 
-    key = os.getenv(PRIVATE_KEY_ENV_NAME)
-    browser_address = os.getenv(PUBLIC_KEY_ENV_NAME)
+        key = os.getenv(PRIVATE_KEY_ENV_NAME)
+        browser_address = os.getenv(PUBLIC_KEY_ENV_NAME)
 
-    if not key or not browser_address:
-        print(colored(
-            f"Missing {PRIVATE_KEY_ENV_NAME} or {PUBLIC_KEY_ENV_NAME} in .env!",
-            "red",
-        ))
-        sys.exit(1)
+        if not key or not browser_address:
+            print(colored(
+                f"Missing {PRIVATE_KEY_ENV_NAME} or {PUBLIC_KEY_ENV_NAME} in .env!",
+                "red",
+            ))
+            sys.exit(1)
 
-    try:
-        browser_wallet = Web3.toChecksumAddress(browser_address)
-    except AttributeError:
-        browser_wallet = Web3.to_checksum_address(browser_address)
+        try:
+            browser_wallet = Web3.toChecksumAddress(browser_address)
+        except AttributeError:
+            browser_wallet = Web3.to_checksum_address(browser_address)
 
-    client = ClobClient(
-        host="https://clob.polymarket.com",
-        chain_id=POLYGON,
-        key=key,
-        signature_type=SIGNATURE_TYPE,
-        funder=browser_wallet,
-    )
+        client = ClobClient(
+            host="https://clob.polymarket.com",
+            chain_id=POLYGON,
+            key=key,
+            signature_type=SIGNATURE_TYPE,
+            funder=browser_wallet,
+        )
 
-    api_key = os.getenv(API_KEY_ENV_NAME)
-    api_secret = (
-        os.getenv(API_SECRET_ENV_NAME)
-        or os.getenv(f"SECRET{ACCOUNT_SUFFIX}")
-        or os.getenv("SECRET")
-    )
-    passphrase = os.getenv(PASSPHRASE_ENV_NAME)
+        api_key = os.getenv(API_KEY_ENV_NAME)
+        api_secret = (
+            os.getenv(API_SECRET_ENV_NAME)
+            or os.getenv(f"SECRET{ACCOUNT_SUFFIX}")
+            or os.getenv("SECRET")
+        )
+        passphrase = os.getenv(PASSPHRASE_ENV_NAME)
 
-    if api_key and api_secret and passphrase:
-        creds = ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=passphrase)
-        client.set_api_creds(creds=creds)
-    else:
-        creds = client.create_or_derive_api_creds()
-        client.set_api_creds(creds=creds)
+        if api_key and api_secret and passphrase:
+            creds = ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=passphrase)
+            client.set_api_creds(creds=creds)
+        else:
+            creds = client.create_or_derive_api_creds()
+            client.set_api_creds(creds=creds)
 
-    _CLIENT_CACHE = client
-    return client
+        _CLIENT_CACHE = client
+        return _CLIENT_CACHE
 
 
 def get_order_status_for_id(order_id):
@@ -451,7 +456,13 @@ def compute_bid_target(favored_book):
         return None
     best_ask = favored_book.get('best_ask')
     best_bid = favored_book.get('best_bid')
-    if best_ask is None or best_ask < ENTRY_THRESHOLD or best_bid is None:
+    if best_bid is None:
+        return None
+    if best_ask is None:
+        if best_bid < ENTRY_THRESHOLD:
+            return None
+        best_ask = 1.00
+    elif best_ask < ENTRY_THRESHOLD:
         return None
     # Keep the post-only BUY strictly below the current best ask.
     max_maker_bid = round(best_ask - 0.01, 3)
@@ -911,6 +922,22 @@ def main():
                                 'size_matched': shares, 'price': market_state.get('last_order_price'),
                                 'has_match': True,
                             }, preserve_open_order=True)
+                        continue
+
+                    favored_book = up_book if market_state.get('favored_side') == "UP" else down_book
+                    if favored_book is not None and compute_bid_target(favored_book) is None:
+                        outcome, status = _cancel_and_confirm(
+                            token_id, 'timeout-assumed-live', 0.15,
+                            market_state.get('exposure_key'),
+                        )
+                        if outcome == "FILLED":
+                            _record_fill(symbol, market_state, status)
+                            _clear_order_state(market_state)
+                        elif outcome == "CANCELED":
+                            _clear_order_state(market_state)
+                            market_state['favored_side'] = None
+                            market_state['favored_token_id'] = None
+                            log_event(f"{symbol} uncertain order canceled (side undecided)", "yellow")
                     continue
 
                 order_id = market_state.get('last_order_id')
