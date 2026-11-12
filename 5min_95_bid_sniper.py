@@ -116,10 +116,10 @@ SESSION_REPRICES = 0
 SESSION_CUTOFF_CANCELS = 0
 SESSION_TIMEOUTS = 0
 SESSION_PAPER_WINS = 0
-SESSION_PAPER_LOSSES = 0
+SESSION_PAPER_LOSES = 0
 SESSION_PAPER_PNL = 0.0
-SESSION_PAPER_COST = 0.0
-SESSION_PAPER_SHARES = 0.0
+SESSION_PAPER_MAX_LOSS = 0.0
+SESSION_PAPER_MAX_PROFIT = 0.0
 SESSION_FILL_PRICES = []
 SESSION_PAPER_PEAK_PNL = 0.0
 SESSION_MAX_DD = 0.0
@@ -339,10 +339,6 @@ def place_limit_order(token_id, side, price, size, neg_risk=False):
             'size': float(size), 'status': 'LIVE', 'created_at': time.time(),
         }
         OPEN_ORDER_COSTS[order_id] = float(price) * float(size)
-        global SESSION_PAPER_COST, SESSION_PAPER_SHARES
-        order_cost = float(price) * float(size) + (float(price) * DRY_RUN_FEE_RATE + DRY_RUN_SLIPPAGE) * float(size)
-        SESSION_PAPER_COST += order_cost
-        SESSION_PAPER_SHARES += float(size)
         log_event(f"DRY RUN: simulated {side} @ ${price:.4f} x {size} (memory only)", "yellow")
         return {'orderID': order_id, 'status': 'LIVE', 'simulated': True}
 
@@ -804,11 +800,15 @@ def _resolve_paper_window(market_states, market_books):
             SESSION_PAPER_WINS += 1
             fees_slip = (entry * DRY_RUN_FEE_RATE + DRY_RUN_SLIPPAGE) * shares
             pnl = (shares * 1.0 - cost) - fees_slip
+            if pnl > SESSION_PAPER_MAX_PROFIT:
+                SESSION_PAPER_MAX_PROFIT = pnl
             SESSION_CURRENT_STREAK = SESSION_CURRENT_STREAK + 1 if SESSION_CURRENT_STREAK >= 0 else 1
         else:
-            SESSION_PAPER_LOSSES += 1
+            SESSION_PAPER_LOSES += 1
             fees_slip = (entry * DRY_RUN_FEE_RATE + DRY_RUN_SLIPPAGE) * shares
             pnl = -(cost + fees_slip)
+            if abs(pnl) > SESSION_PAPER_MAX_LOSS:
+                SESSION_PAPER_MAX_LOSS = abs(pnl)
             SESSION_CURRENT_STREAK = SESSION_CURRENT_STREAK - 1 if SESSION_CURRENT_STREAK <= 0 else -1
         SESSION_PAPER_PNL += pnl
         if SESSION_PAPER_PNL > SESSION_PAPER_PEAK_PNL:
@@ -1380,8 +1380,8 @@ def draw_dashboard(market_states, market_books, time_left):
             risk_row_2_left.append(_seg(" " * separator))
         risk_row_2_left += chunk
     if DRY_RUN:
-        loss_value = _signed_money(-SESSION_PAPER_COST)
-        profit_value = _signed_money(max(0.0, SESSION_PAPER_SHARES - SESSION_PAPER_COST))
+        loss_value = _signed_money(-SESSION_PAPER_MAX_LOSS)
+        profit_value = _signed_money(SESSION_PAPER_MAX_PROFIT)
     else:
         loss_value = _signed_money(-filled_cost)
         profit_value = _signed_money(max(0.0, filled_shares - filled_cost))
