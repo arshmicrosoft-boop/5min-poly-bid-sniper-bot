@@ -287,7 +287,7 @@ def run_all(args):
             print(f"  - {name} ({note})")
         print("VERDICT: FAIL — not ready for live.")
     else:
-        print("VERDICT: PASS / READY — all gates cleared.")
+        print("DATASET GATES: PASS — this does not certify the live bot or authorize live trading.")
 
     # save
     out = Path(args.out)
@@ -296,7 +296,8 @@ def run_all(args):
         "baseline": base_m, "stress": stress_m, "fill50": fill50_m,
         "sweep": [{"price": p, **m} for p, m in sweep],
         "gates": [{"name": g[0], "status": g[1], "note": g[2]} for g in gates],
-        "verdict": "PASS" if not fails else "FAIL",
+        "verdict": "DATASET_GATES_PASS" if not fails else "DATASET_GATES_FAIL",
+        "live_ready": False,
     }, indent=2, default=str))
     print(f"\nFull report saved: {out.resolve()}")
 

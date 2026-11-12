@@ -3,8 +3,8 @@
 > **A patient, post-only maker bot for BTC/ETH/SOL/XRP/DOGE 5-minute UP/DOWN markets.**
 > Decided sides only. No chasing. No market orders. Ever.
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](#requirements)
-[![Live on Polymarket CLOB](https://img.shields.io/badge/exchange-Polymarket%20CLOB-green.svg)](#)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](#requirements)
+[![Live mode locked](https://img.shields.io/badge/live-mode%20locked-red.svg)](#safety--qualification-gates)
 [![Dry Run Default](https://img.shields.io/badge/dry--run-default-yellow.svg)](#safety)
 
 ---
@@ -17,8 +17,10 @@ We **do not** market-buy at 96¢. We **rest a passive BUY limit on the bid**, ca
 
 - One entry per market, per coin. Hold to expiry.
 - Stand down if the side stops being decided (ask drops below 0.95).
-- Cancel unfilled orders at 5s remaining.
-- Track positions via the data API; never double-submit.
+- Stop opening bids at 15s remaining; cancel resting orders at 10s remaining.
+- Dry-run does not claim fills, win rate, or PnL without trade-print and official-resolution data.
+- Reconcile positions and open orders through Polymarket's current unified SDK (Data API v2); never double-submit.
+- Live order placement stays hard-disabled until confirmed fills, official resolution, and realized loss limits are durably reconciled.
 
 ---
 
@@ -54,20 +56,20 @@ We **do not** market-buy at 96¢. We **rest a passive BUY limit on the bid**, ca
 
 ### Order lifecycle
 ```
-IDLE → decided side detected → rest bid (post-only, GTC)
+IDLE → decided side detected → rest bid (post-only, GTD with expiry)
   → re-check every 3s → price drift? cancel+resubmit
-  → fill detected (positions API) → ENTERED (hold to expiry)
-  → 5s remaining → cancel unfilled → CUTOFF
-  → market rollover → cancel all → IDLE (next window)
+  → fill detected from the CLOB order status → ENTERED (hold to expiry)
+  → 15s no-new-entry → 10s cancel resting → CUTOFF
+  → market rollover → cancel each known order ID → carry held-position exposure
 ```
 
 ### Safety layers
 1. **Dry run default** — `DRY_RUN=true` unless explicitly disabled. No orders sent.
 2. **Post-only** — every order is `post_only=True`; never crosses the spread.
-3. **Price cap** — `min(best_bid, 0.95)`; never pays above 95¢.
-4. **Exposure cap** — total resting notional ≤ `MAX_TOTAL_EXPOSURE_USD` (default $10).
+3. **Price cap** — never bids above `MAX_BUY_PRICE` (default 95¢).
+4. **Exposure cap** — resting plus filled notional ≤ `MAX_TOTAL_EXPOSURE_USD` (default $5), carried across market windows. Filled-position reserves are not released during the session because authoritative settlement accounting is not implemented; after a fill this can stop further entries.
 5. **Timeout-assumed-live** — if a POST times out, treat as potentially live and block duplicates.
-6. **Cancel-and-confirm** — verify cancellation before resubmitting.
+6. **Cancel-and-confirm** — only release a reservation after the unified SDK confirms the exact order ID was canceled and the order status is terminal; `NOT_FOUND` remains unresolved.
 7. **One entry per market** — `entered` flag prevents re-entry.
 
 ---
@@ -110,6 +112,8 @@ SOFT_ENTRY_CUTOFF_SEC=15
 STOP_THRESHOLD_SEC=10
 ```
 
+The repository pins `polymarket-client` (the current unified SDK). Older `py-clob-client-v2` and `web3` packages are not used by this bot.
+
 Strategy constants in `5min_95_bid_sniper.py`:
 
 | Setting | Default | Meaning |
@@ -121,7 +125,8 @@ Strategy constants in `5min_95_bid_sniper.py`:
 | `ENTRY_WINDOW_SEC` | `60` | Only act in final 60s |
 | `SOFT_ENTRY_CUTOFF_SEC` | `15` | Stop opening new orders below this; existing orders are still managed |
 | `STOP_THRESHOLD_SEC` | `10` | Cancel resting orders at/below this threshold |
-| `ORDER_UPDATE_INTERVAL` | `3` | Re-check cadence (seconds) |
+| `ORDER_UPDATE_INTERVAL` | `1` | Re-check cadence (seconds) |
+| `SIGNATURE_TYPE` | `2` | Must match the funded wallet; default is the configured AUG14 Safe wallet |
 | `MAX_TOTAL_EXPOSURE_USD` | `5.0` | Global resting plus filled exposure cap |
 | `MAX_SESSION_LOSS_USD` | `8.0` | Dry-run loss limit; stops the session and cancels resting orders |
 | `MAX_POSITION_LOSS_USD` | `4.50` | Marked-loss alert/halt for new entries; does not exit held positions |
@@ -168,7 +173,11 @@ Fast, but uses Binance TWAP settlement and synthetic books — **not** real Poly
 
 ## 🛡️ Safety & qualification gates
 
-A strategy only goes live if **all** gates pass:
+**Live mode is locked in code.** `DRY_RUN=false` exits before account actions because the bot still lacks durable, authoritative accounting that joins every partial fill, fee, and official market settlement to the session-loss guard. Dry-run monitors live books and manages simulated orders in memory, but does not claim fills or settlement PnL from quote touches. No backtest result currently qualifies this implementation for live trading.
+
+Backtest gates are necessary but not sufficient for live use. The backtest report is a dataset-level result only; it cannot certify the live bot or unlock live order placement. The live lock also requires verified account reconciliation, durable fill/fee/settlement accounting, and enforced loss limits.
+
+A strategy is considered for further evaluation only if **all** gates pass:
 
 | # | Gate | Threshold |
 |---|---|---|
@@ -189,26 +198,12 @@ A strategy only goes live if **all** gates pass:
 
 ---
 
-## 🔬 30-day backtest snapshot (recorded CLOB, 0.95 threshold)
+## Historical backtest figures
 
-| Metric | Value |
-|---|---:|
-| Windows scanned | 8,639 |
-| Trades (filled) | 1,236 |
-| Wins | 1,218 |
-| Win Rate | 98.54% |
-| Breakeven (maker @ 95¢) | 95.00% |
-| Edge | +3.54% |
-| Net PnL | +$228.49 |
-| Max Drawdown | $11.57 |
-| Max Lose Streak | 1 |
-| Bootstrap 95% CI | [97.27%, 98.81%] |
-| Inverted (placebo) WR | 1.88% |
-
-**Verdict: PASS / READY.**
+Older versions of this README listed a 30-day result of 98.54% win rate and `PASS / READY`. Those figures are unverified and must not be used as evidence that this bot or its current filters are profitable. The live filters, paper-fill behavior, and historical backtest assumptions are not equivalent. The current dry-run deliberately does not score quote touches as fills or infer settlement from cached books. A defensible result requires recorded trade prints, queue-aware fills, and the official resolved outcome for each market.
 
 ---
 
 ## 📜 License & disclaimer
 
-Educational/research software. Live mode submits **real orders** on Polymarket. You are responsible for your funds. Start with `DRY_RUN=true`, monitor the dashboard and your account, and never commit `.env`.
+Educational/research software. Live mode is intentionally disabled pending authoritative fill and settlement accounting. Keep `DRY_RUN=true`; never commit `.env`.

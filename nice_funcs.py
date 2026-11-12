@@ -42,5 +42,5 @@ def get_token_id(market_id):
         down_id = next((v for k, v in indexed.items() if k in ("down", "no")), None)
         if up_id and down_id:
             return [market_id, str(up_id), str(down_id)]
-    # BTC up/down five-minute markets list outcomes as Up then Down.
-    return [market_id, str(token_ids[0]), str(token_ids[1])]
+    # Token ordering is not a substitute for explicit outcome labels.
+    return []

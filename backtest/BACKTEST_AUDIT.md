@@ -1,5 +1,9 @@
 # Backtest Audit — Reconciliation, Fill Model, and Validation Plan
 
+## Status and use
+
+This audit describes limitations in the replay model; it does not validate a strategy or qualify the live bot. There is no recorded input dataset in the repository, so the cited figures below are not reproducible from the checked-in files. A `PASS` from the replay gates is now labeled as a dataset-level result and must never be read as live readiness. The bot itself remains hard-locked to dry-run.
+
 ## 1. Reconciliation: 0.95 headline vs. sweep row
 
 Two different numbers appear for the 0.95 threshold in `backtest/results/backtest_30d_report.md`:

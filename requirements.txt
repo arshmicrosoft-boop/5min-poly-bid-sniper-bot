@@ -1,8 +1,7 @@
 requests
 python-dotenv
 termcolor
-web3
-py-clob-client
-websockets
+polymarket-client==0.18.0
+websockets>=13,<16
 numpy
 scipy
